@@ -323,3 +323,58 @@ def get_activation(act_name):
     else:
         print("invalid activation function!")
         return None
+
+'''
+
+proprio_obs: current proprioceptive observation (o_t)
+base_velocity: current base velocity (v_t)
+foot_clearance: current foot clearance (h^f_t)
+height_map_encoding: encoding of the height map (z^m_t)
+latent_vector: latent vector (z_t)
+
+'''
+
+class PIEActor(nn.Module):
+    def __init__(self, num_proprio, 
+                 num_actions, 
+                 velocity_dim=3, 
+                 foot_clearance_dim=4, 
+                 height_map_dim=32, 
+                 latent_dim=32,
+                 hidden_dims=[512, 256, 128], 
+                 activation='elu'):
+        super(PIEActor, self).__init__()
+        
+        self.num_proprio = num_proprio
+        activation_fn = get_activation(activation)
+        
+        total_input_dim = (num_proprio + 
+                           velocity_dim + 
+                           foot_clearance_dim + 
+                           height_map_dim + 
+                           latent_dim)
+        
+        actor_layers = []
+        actor_layers.append(nn.Linear(total_input_dim, hidden_dims[0]))
+        actor_layers.append(activation_fn)
+        
+        for l in range(len(hidden_dims) - 1):
+            actor_layers.append(nn.Linear(hidden_dims[l], hidden_dims[l+1]))
+            actor_layers.append(activation_fn)
+            
+        actor_layers.append(nn.Linear(hidden_dims[-1], num_actions))
+        
+        self.actor = nn.Sequential(*actor_layers)
+    
+    def forward(self, proprio_obs, base_velocity, foot_clearance, height_map_encoding, latent_vector):
+        inputs = torch.cat([
+            proprio_obs,
+            base_velocity,
+            foot_clearance,
+            height_map_encoding,
+            latent_vector
+        ], dim=1)
+        
+        actions = self.actor(inputs)
+        
+        return actions
