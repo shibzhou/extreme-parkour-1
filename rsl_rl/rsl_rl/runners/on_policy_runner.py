@@ -47,6 +47,9 @@ import sys
 from copy import copy, deepcopy
 import warnings
 
+from rsl_rl.rsl_rl.modules.actor_critic import PIEActorCritic
+from rsl_rl.rsl_rl.algorithms.ppo import PIEPPO
+
 class OnPolicyRunner:
 
     def __init__(self,
@@ -116,7 +119,54 @@ class OnPolicyRunner:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
-        
+
+        # Check if we're using PIE mode
+        self.use_pie = train_cfg.get("use_pie", False)
+        if self.use_pie:
+            print("Using PIE (Parkour with Implicit-Explicit learning) Actor-Critic structure")
+            actor_critic = PIEActorCritic(
+                num_proprio=self.env.cfg.env.n_proprio,
+                num_scan=self.env.cfg.env.n_scan,
+                num_critic_obs=self.env.num_obs,
+                velocity_dim=3,
+                foot_clearance_dim=4,
+                height_map_dim=32,
+                latent_dim=32,
+                hist_len=self.env.cfg.env.history_len,
+                num_actions=self.env.num_actions,
+                actor_hidden_dims=self.policy_cfg["actor_hidden_dims"],
+                critic_hidden_dims=self.policy_cfg["critic_hidden_dims"],
+                activation=self.policy_cfg["activation"],
+                init_noise_std=self.policy_cfg["init_noise_std"]
+            ).to(self.device)
+            
+            # Create PIE-specific algorithm
+            alg_class = PIEPPO
+            self.alg = alg_class(
+                actor_critic=actor_critic,
+                num_learning_epochs=self.alg_cfg["num_learning_epochs"],
+                num_mini_batches=self.alg_cfg["num_mini_batches"],
+                clip_param=self.alg_cfg["clip_param"],
+                gamma=self.alg_cfg["gamma"],
+                lam=self.alg_cfg["lam"],
+                value_loss_coef=self.alg_cfg["value_loss_coef"],
+                entropy_coef=self.alg_cfg["entropy_coef"],
+                learning_rate=self.alg_cfg["learning_rate"],
+                max_grad_norm=self.alg_cfg["max_grad_norm"],
+                use_clipped_value_loss=self.alg_cfg["use_clipped_value_loss"],
+                schedule=self.alg_cfg["schedule"],
+                desired_kl=self.alg_cfg["desired_kl"],
+                device=self.device,
+                # PIE-specific parameters
+                velocity_loss_coef=self.alg_cfg.get("velocity_loss_coef", 1.0),
+                foot_clearance_loss_coef=self.alg_cfg.get("foot_clearance_loss_coef", 1.0),
+                height_map_loss_coef=self.alg_cfg.get("height_map_loss_coef", 1.0),
+                kl_loss_coef=self.alg_cfg.get("kl_loss_coef", 0.1),
+                next_state_loss_coef=self.alg_cfg.get("next_state_loss_coef", 1.0)
+            )
+            # Replace the learn method with PIE-specific implementation
+            self.learn = self.learn_pie
+                
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.
@@ -554,3 +604,226 @@ class OnPolicyRunner:
         if device is not None:
             self.alg.discriminator.to(device)
         return self.alg.discriminator.inference
+
+    def learn_pie(self, num_learning_iterations, init_at_random_ep_len=False):
+        """Training loop for the PIE (Parkour with Implicit-Explicit learning) framework."""
+        # Initialize tracking variables
+        mean_value_loss = 0.
+        mean_surrogate_loss = 0.
+        mean_velocity_loss = 0.
+        mean_foot_clearance_loss = 0.
+        mean_height_map_loss = 0.
+        mean_kl_loss = 0.
+        mean_next_state_loss = 0.
+        
+        # Initialize buffers for tracking metrics
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Get initial observations
+        obs = self.env.get_observations()
+        privileged_obs = self.env.get_privileged_observations()
+        critic_obs = privileged_obs if privileged_obs is not None else obs
+        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        
+        # Initialize depth and prop history buffers
+        depth_images = self.env.depth_buffer.clone().to(self.device) if hasattr(self.env, "depth_buffer") else None
+        prop_history = torch.zeros((self.env.num_envs, self.alg.actor_critic.hist_len, self.alg.actor_critic.num_proprio), 
+                                device=self.device)
+        
+        # Set models to training mode
+        self.alg.actor_critic.train()
+        
+        # Track iterations
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+        self.start_learning_iteration = copy(self.current_learning_iteration)
+
+        for it in range(self.current_learning_iteration, tot_iter):
+            start = time.time()
+            
+            # Rollout phase - collect experience
+            with torch.inference_mode():
+                for i in range(self.num_steps_per_env):
+                    # Update prop_history with current observation
+                    prop_history = torch.roll(prop_history, shifts=-1, dims=1)
+                    prop_history[:, -1] = obs[:, :self.alg.actor_critic.num_proprio]
+                    
+                    # Get actions from PIE actor critic
+                    actions, base_velocity, foot_clearance, height_map_encoding, latent_vector = self.alg.actor_critic.act(
+                        obs[:, :self.alg.actor_critic.num_proprio], 
+                        depth_images, 
+                        prop_history,
+                        return_estimations=True
+                    )
+                    
+                    # Step the environment
+                    next_obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
+                    critic_obs = privileged_obs if privileged_obs is not None else next_obs
+                    next_obs, critic_obs, rewards, dones = next_obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    
+                    # Get new depth images
+                    if hasattr(self.env, "depth_buffer"):
+                        depth_images = self.env.depth_buffer.clone().to(self.device)
+                    
+                    # Extract ground truth for training the estimator if available
+                    info_dict = {
+                        "true_velocity": infos.get("true_velocity", None),
+                        "true_foot_clearance": infos.get("true_foot_clearance", None),
+                        "true_height_map": infos.get("true_height_map", None),
+                        "next_state": next_obs[:, :self.alg.actor_critic.num_proprio]  # Use the next proprio state as target
+                    }
+                    
+                    # Process environment step
+                    total_rew = self.alg.process_env_step(rewards, dones, info_dict)
+                    
+                    # Update observations for next step
+                    obs = next_obs
+                    
+                    # Bookkeeping
+                    if self.log_dir is not None:
+                        if 'episode' in infos:
+                            ep_infos.append(infos['episode'])
+                        cur_reward_sum += total_rew
+                        cur_episode_length += 1
+                        
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+                
+                stop = time.time()
+                collection_time = stop - start
+                
+                # Compute returns for value function training
+                start = stop
+                self.alg.compute_returns(critic_obs)
+            
+            # Update using PIEPPO
+            update_results = self.alg.update()
+            mean_value_loss = update_results['value_loss']
+            mean_surrogate_loss = update_results['surrogate_loss']
+            mean_velocity_loss = update_results['velocity_loss']
+            mean_foot_clearance_loss = update_results['foot_clearance_loss']
+            mean_height_map_loss = update_results['height_map_loss']
+            mean_kl_loss = update_results['kl_loss']
+            mean_next_state_loss = update_results['next_state_loss']
+            
+            stop = time.time()
+            learn_time = stop - start
+            
+            # Logging
+            if self.log_dir is not None:
+                self.log_pie(locals())
+            
+            # Save model periodically
+            if it < 2500:
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
+            elif it < 5000:
+                if it % (2*self.save_interval) == 0:
+                    self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
+            else:
+                if it % (5*self.save_interval) == 0:
+                    self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
+            
+            ep_infos.clear()
+        
+        # Save final model
+        self.save(os.path.join(self.log_dir, f'model_{self.current_learning_iteration}.pt'))
+
+    def log_pie(self, locs, width=80, pad=35):
+        """Logging method for PIE training."""
+        self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+        self.tot_time += locs['collection_time'] + locs['learn_time']
+        iteration_time = locs['collection_time'] + locs['learn_time']
+
+        ep_string = f''
+        wandb_dict = {}
+        
+        # Log episode information
+        if locs['ep_infos']:
+            for key in locs['ep_infos'][0]:
+                infotensor = torch.tensor([], device=self.device)
+                for ep_info in locs['ep_infos']:
+                    # handle scalar and zero dimensional tensor infos
+                    if not isinstance(ep_info[key], torch.Tensor):
+                        ep_info[key] = torch.Tensor([ep_info[key]])
+                    if len(ep_info[key].shape) == 0:
+                        ep_info[key] = ep_info[key].unsqueeze(0)
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                value = torch.mean(infotensor)
+                wandb_dict['Episode_rew/' + key] = value
+                ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+        
+        # Calculate metrics
+        mean_std = self.alg.actor_critic.std.mean()
+        fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
+
+        # Log loss values
+        wandb_dict['Loss/value_function'] = locs['mean_value_loss']
+        wandb_dict['Loss/surrogate'] = locs['mean_surrogate_loss']
+        wandb_dict['Loss/velocity'] = locs['mean_velocity_loss']
+        wandb_dict['Loss/foot_clearance'] = locs['mean_foot_clearance_loss']
+        wandb_dict['Loss/height_map'] = locs['mean_height_map_loss']
+        wandb_dict['Loss/kl'] = locs['mean_kl_loss']
+        wandb_dict['Loss/next_state'] = locs['mean_next_state_loss']
+        wandb_dict['Loss/learning_rate'] = self.alg.learning_rate
+
+        # Log other metrics
+        wandb_dict['Policy/mean_noise_std'] = mean_std.item()
+        wandb_dict['Perf/total_fps'] = fps
+        wandb_dict['Perf/collection_time'] = locs['collection_time']
+        wandb_dict['Perf/learning_time'] = locs['learn_time']
+        
+        if len(locs['rewbuffer']) > 0:
+            wandb_dict['Train/mean_reward'] = statistics.mean(locs['rewbuffer'])
+            wandb_dict['Train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
+        
+        # Send to wandb
+        wandb.log(wandb_dict, step=locs['it'])
+
+        # Create console output
+        str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
+
+        if len(locs['rewbuffer']) > 0:
+            log_string = (f"""{'#' * width}\n"""
+                        f"""{str.center(width, ' ')}\n\n"""
+                        f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                        f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                        f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                        f"""{'Velocity loss:':>{pad}} {locs['mean_velocity_loss']:.4f}\n"""
+                        f"""{'Foot clearance loss:':>{pad}} {locs['mean_foot_clearance_loss']:.4f}\n"""
+                        f"""{'Height map loss:':>{pad}} {locs['mean_height_map_loss']:.4f}\n"""
+                        f"""{'KL loss:':>{pad}} {locs['mean_kl_loss']:.4f}\n"""
+                        f"""{'Next state loss:':>{pad}} {locs['mean_next_state_loss']:.4f}\n"""
+                        f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                        f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+                        f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
+        else:
+            log_string = (f"""{'#' * width}\n"""
+                        f"""{str.center(width, ' ')}\n\n"""
+                        f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                        f"""{'Value loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+                        f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                        f"""{'PIE losses total:':>{pad}} {locs['mean_velocity_loss'] + locs['mean_foot_clearance_loss'] + locs['mean_height_map_loss'] + locs['mean_kl_loss'] + locs['mean_next_state_loss']:.4f}\n""")
+
+        log_string += f"""{'-' * width}\n"""
+        log_string += ep_string
+        
+        # ETA calculation
+        curr_it = locs['it'] - self.start_learning_iteration
+        eta = self.tot_time / (curr_it + 1) * (locs['num_learning_iterations'] - curr_it)
+        mins = eta // 60
+        secs = eta % 60
+        
+        log_string += (f"""{'-' * width}\n"""
+                    f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
+                    f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+                    f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
+                    f"""{'ETA:':>{pad}} {mins:.0f} mins {secs:.1f} s\n""")
+        
+        print(log_string)
