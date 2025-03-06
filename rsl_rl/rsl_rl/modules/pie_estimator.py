@@ -4,12 +4,14 @@ import torch.nn.functional as F
 
 class PIEEstimator(nn.Module):
     def __init__(self, 
-                 input_dim_prop, 
-                 input_dim_depth,  
-                 output_dim_explicit, 
-                 output_dim_latent,  
-                 hidden_dim=512,  
-                 hist_len=10): 
+                input_dim_prop, 
+                input_dim_depth,  
+                output_dim_velocity,
+                output_dim_foot_clearance,
+                output_dim_height_map,
+                output_dim_latent,  
+                hidden_dim=512,  
+                hist_len=10):
         super(PIEEstimator, self).__init__()
         
         self.hist_len = hist_len
@@ -39,11 +41,17 @@ class PIEEstimator(nn.Module):
         )
 
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
-        
-        self.explicit_estimator = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
+            
+        self.velocity_estimator = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(128, output_dim_explicit)
+            nn.Linear(64, output_dim_velocity)
+        )
+        
+        self.foot_clearance_estimator = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim_foot_clearance)
         )
         
         self.latent_mu = nn.Linear(hidden_dim, output_dim_latent)
@@ -91,7 +99,10 @@ class PIEEstimator(nn.Module):
     def forward(self, depth_images, prop_history):
         encoded_features = self.encode(depth_images, prop_history)
 
-        explicit_estimates = self.explicit_estimator(encoded_features)
+        # explicit_estimates = self.explicit_estimator(encoded_features)
+        
+        base_velocity = self.velocity_estimator(encoded_features)
+        foot_clearance = self.foot_clearance_estimator(encoded_features)
 
         latent_mu = self.latent_mu(encoded_features)
         latent_logvar = self.latent_logvar(encoded_features)
@@ -107,8 +118,7 @@ class PIEEstimator(nn.Module):
         
         next_state_estimate = self.successor_decoder(latent_vector)
         
-        return explicit_estimates, latent_vector, height_map_estimate, next_state_estimate, latent_mu, latent_logvar
-    
+        return base_velocity, foot_clearance, height_map_estimate, latent_vector, latent_mu, latent_logvar, next_state_estimate    
     def compute_loss(self, explicit_estimates, height_map_estimate, next_state_estimate, 
                       latent_mu, latent_logvar, true_explicit, true_height_map, true_next_state):
         kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())

@@ -36,6 +36,9 @@ import torch.nn as nn
 from torch.distributions import Normal
 from torch.nn.modules import rnn
 from torch.nn.modules.activation import ReLU
+from pie_estimator import PIEEstimator
+import torch.nn.functional as F
+
 
 
 class StateHistoryEncoder(nn.Module):
@@ -378,3 +381,163 @@ class PIEActor(nn.Module):
         actions = self.actor(inputs)
         
         return actions
+
+class PIEActorCritic(nn.Module):
+    def __init__(self,
+                num_proprio,
+                num_scan,
+                num_critic_obs, 
+                velocity_dim=3,
+                foot_clearance_dim=4,
+                height_map_dim=32,
+                latent_dim=32,
+                hist_len=10,
+                num_actions=2,
+                actor_hidden_dims=[512, 256, 128],
+                critic_hidden_dims=[512, 256, 128],
+                activation='elu',
+                init_noise_std=1.0):
+        super(PIEActorCritic, self).__init__()
+
+        # PIE estimator
+        output_dim_explicit = velocity_dim + foot_clearance_dim
+
+        self.estimator = PIEEstimator(
+            input_dim_prop=num_proprio,
+            input_dim_depth=num_scan,
+            output_dim_velocity=velocity_dim,
+            output_dim_foot_clearance=foot_clearance_dim,
+            output_dim_height_map=height_map_dim,
+            output_dim_latent=latent_dim,
+            hidden_dim=512,
+            hist_len=hist_len
+        )
+        # Actor
+        self.actor = PIEActor(
+            num_proprio=num_proprio,
+            num_actions=num_actions,
+            velocity_dim=velocity_dim,
+            foot_clearance_dim=foot_clearance_dim,
+            height_map_dim=height_map_dim,
+            latent_dim=latent_dim,
+            hidden_dims=actor_hidden_dims,
+            activation=activation
+        )
+        
+        # same critic as in ActorCriticRMA
+        activation_fn = get_activation(activation)
+        critic_layers = []
+        critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
+        critic_layers.append(activation_fn)
+        for l in range(len(critic_hidden_dims)):
+            if l == len(critic_hidden_dims) - 1:
+                critic_layers.append(nn.Linear(critic_hidden_dims[l], 1))
+            else:
+                critic_layers.append(nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l+1]))
+                critic_layers.append(activation_fn)
+        self.critic = nn.Sequential(*critic_layers)
+        
+        # Action noise for exploration
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args = False
+        
+    def act(self, proprio_obs, depth_images, prop_history, return_estimations=False):
+        # Run the estimator
+        base_velocity, foot_clearance, height_map_encoding, latent_vector, _, _, _ = self.estimator(
+            depth_images, prop_history
+        )
+        
+        actions_mean = self.actor(
+            proprio_obs, 
+            base_velocity, 
+            foot_clearance, 
+            height_map_encoding, 
+            latent_vector
+        )
+        
+        self.distribution = Normal(actions_mean, self.std)
+        actions = self.distribution.sample()
+        
+        if return_estimations:
+            return actions, base_velocity, foot_clearance, height_map_encoding, latent_vector
+        else:
+            return actions
+            
+    def act_inference(self, proprio_obs, depth_images, prop_history):
+
+        with torch.no_grad():
+            base_velocity, foot_clearance, height_map_encoding, latent_vector, _, _, _ = self.estimator(
+                depth_images, prop_history
+            )
+            
+            actions = self.actor(
+                proprio_obs, 
+                base_velocity, 
+                foot_clearance, 
+                height_map_encoding, 
+                latent_vector
+            )
+            
+        return actions
+    
+    def evaluate(self, critic_obs):
+        value = self.critic(critic_obs)
+        return value
+    
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+    
+    def compute_pie_loss(self, estimator_outputs, ground_truth):
+        """
+        Compute the PIE loss as defined in the paper
+        """
+        # estimator outputs
+        base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = estimator_outputs
+        
+        # ground truth
+        true_velocity, true_foot_clearance, true_height_map, true_next_state = ground_truth
+        
+        # KL divergence loss for VAE (latent vector)
+        kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
+        
+        # MSE losses for reconstructions and estimations
+        velocity_loss = F.mse_loss(base_velocity, true_velocity)
+        foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance)
+        height_map_loss = F.mse_loss(height_map_encoding, true_height_map)
+        next_state_loss = F.mse_loss(next_state_pred, true_next_state)
+        
+        total_loss = kl_loss + velocity_loss + foot_clearance_loss + height_map_loss + next_state_loss
+        
+        return total_loss, {
+            'kl_loss': kl_loss.item(),
+            'velocity_loss': velocity_loss.item(),
+            'foot_clearance_loss': foot_clearance_loss.item(),
+            'height_map_loss': height_map_loss.item(),
+            'next_state_loss': next_state_loss.item()
+        }
+
+    @staticmethod
+    # not used at the moment
+    def init_weights(sequential, scales):
+        [torch.nn.init.orthogonal_(module.weight, gain=scales[idx]) for idx, module in
+         enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
+
+    def reset(self, dones=None):
+        pass
+
+    def forward(self):
+        raise NotImplementedError
+    
+    @property
+    def action_mean(self):
+        return self.distribution.mean
+
+    @property
+    def action_std(self):
+        return self.distribution.stddev
+    
+    @property
+    def entropy(self):
+        return self.distribution.entropy().sum(dim=-1)
