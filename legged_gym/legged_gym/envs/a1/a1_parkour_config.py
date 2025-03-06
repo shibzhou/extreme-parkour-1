@@ -32,6 +32,7 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 
 
 class A1ParkourCfg( LeggedRobotCfg ):
+
     class init_state( LeggedRobotCfg.init_state ):
         pos = [0.0, 0.0, 0.42] # x,y,z [m]
         default_joint_angles = { # = target angles [rad] when action = 0.0
@@ -72,8 +73,19 @@ class A1ParkourCfg( LeggedRobotCfg ):
         base_height_target = 0.25
 
 class A1ParkourCfgPPO( LeggedRobotCfgPPO ):
+
+    use_pie = True 
+
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         entropy_coef = 0.01
+        
+        #  PIE-specific parameters
+        velocity_loss_coef = 1.0
+        foot_clearance_loss_coef = 1.0
+        height_map_loss_coef = 1.0
+        kl_loss_coef = 0.1
+        next_state_loss_coef = 1.0
+
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = ''
         experiment_name = 'rough_a1'

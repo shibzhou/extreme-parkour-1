@@ -47,8 +47,8 @@ import sys
 from copy import copy, deepcopy
 import warnings
 
-from rsl_rl.rsl_rl.modules.actor_critic import PIEActorCritic
-from rsl_rl.rsl_rl.algorithms.ppo import PIEPPO
+from rsl_rl.modules.actor_critic import PIEActorCritic
+from rsl_rl.algorithms.ppo import PIEPPO
 
 class OnPolicyRunner:
 
