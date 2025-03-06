@@ -415,3 +415,32 @@ class LeggedRobotCfgPPO(BaseConfig):
         load_run = -1 # -1 = last run
         checkpoint = -1 # -1 = last saved model
         resume_path = None # updated from load_run and chkpt
+
+
+class PIERobotCfg(LeggedRobotCfg):
+    class env(LeggedRobotCfg.env):
+        history_len = 10 
+        n_proprio = 53 
+        n_scan = 132  
+        n_priv = 3 + 3 + 3 
+        n_priv_latent = 4 + 1 + 12 + 12 
+        use_foot_clearance = True  
+
+    class depth: 
+        use_camera = True
+        buffer_len = 2 
+        camera_resolution = (58, 87)
+
+    class rewards(LeggedRobotCfg.rewards):
+        class scales(LeggedRobotCfg.rewards.scales):
+            tracking_vel = 1.5  # Velocity tracking reward weight
+            tracking_ang = 0.5  # Angular velocity tracking reward weight
+            lin_vel_z = -1.0  # Linear velocity z penalty
+            ang_vel_xy = -0.05  # Angular velocity xy penalty
+            orientation = -1.0  # Orientation penalty
+            joint_acc = -2.5e-7  # Joint acceleration penalty
+            joint_power = -2e-5  # Joint power penalty
+            collision = -10.0  # Collision penalty
+            action_rate = -0.01  # Action rate penalty
+            smoothness = -0.01  # Smoothness penalty
+            feet_edge = -4.0  # New: feet edge clearance penalty
