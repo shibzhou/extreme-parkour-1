@@ -36,6 +36,7 @@ from rsl_rl.utils import split_and_pad_trajectories
 class RolloutStorage:
     class Transition:
         def __init__(self):
+            # Standard PPO fields
             self.observations = None
             self.critic_observations = None
             self.actions = None
@@ -46,6 +47,21 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            
+            # PIE-specific fields
+            self.depth_images = None
+            self.prop_history = None
+            self.base_velocity = None
+            self.foot_clearance = None
+            self.height_map_encoding = None
+            self.latent_vector = None
+            self.latent_mu = None
+            self.latent_logvar = None
+            self.next_state_pred = None
+            self.true_velocity = None
+            self.true_foot_clearance = None
+            self.true_height_map = None
+            self.true_next_state = None
         def clear(self):
             self.__init__()
 
@@ -243,3 +259,175 @@ class RolloutStorage:
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch
                 
                 first_traj = last_traj
+    def init_pie_buffers(self, num_envs, num_transitions_per_env, depth_shape, prop_history_shape, 
+                         velocity_dim, foot_clearance_dim, height_map_dim, latent_dim):
+        # Depth images buffer
+        self.depth_images = torch.zeros(num_transitions_per_env, num_envs, *depth_shape, device=self.device)
+        
+        # Proprioceptive history buffer
+        self.prop_history = torch.zeros(num_transitions_per_env, num_envs, *prop_history_shape, device=self.device)
+        
+        # PIE estimator outputs
+        self.base_velocity = torch.zeros(num_transitions_per_env, num_envs, velocity_dim, device=self.device)
+        self.foot_clearance = torch.zeros(num_transitions_per_env, num_envs, foot_clearance_dim, device=self.device)
+        self.height_map_encoding = torch.zeros(num_transitions_per_env, num_envs, height_map_dim, device=self.device)
+        self.latent_vector = torch.zeros(num_transitions_per_env, num_envs, latent_dim, device=self.device)
+        self.latent_mu = torch.zeros(num_transitions_per_env, num_envs, latent_dim, device=self.device)
+        self.latent_logvar = torch.zeros(num_transitions_per_env, num_envs, latent_dim, device=self.device)
+        self.next_state_pred = None  # Will initialize when we know the shape
+        
+        # Ground truth values for PIE training
+        self.true_velocity = torch.zeros(num_transitions_per_env, num_envs, velocity_dim, device=self.device)
+        self.true_foot_clearance = torch.zeros(num_transitions_per_env, num_envs, foot_clearance_dim, device=self.device)
+        self.true_height_map = torch.zeros(num_transitions_per_env, num_envs, height_map_dim, device=self.device)
+        self.true_next_state = None  # Will initialize when we know the shape
+        
+        # Flags to track whether ground truth data is available
+        self.has_true_velocity = False
+        self.has_true_foot_clearance = False
+        self.has_true_height_map = False
+        self.has_true_next_state = False
+
+    def add_transitions(self, transition):
+        """Add PIE-specific transitions to storage."""
+        if self.step >= self.num_transitions_per_env:
+            raise AssertionError("Rollout buffer overflow")
+            
+        super().add_transitions(transition)  
+        
+        # Store PIE-specific data
+        if hasattr(transition, 'depth_images') and transition.depth_images is not None:
+            self.depth_images[self.step].copy_(transition.depth_images)
+            
+        if hasattr(transition, 'prop_history') and transition.prop_history is not None:
+            self.prop_history[self.step].copy_(transition.prop_history)
+        
+        if hasattr(transition, 'base_velocity') and transition.base_velocity is not None:
+            self.base_velocity[self.step].copy_(transition.base_velocity)
+            
+        if hasattr(transition, 'foot_clearance') and transition.foot_clearance is not None:
+            self.foot_clearance[self.step].copy_(transition.foot_clearance)
+            
+        if hasattr(transition, 'height_map_encoding') and transition.height_map_encoding is not None:
+            self.height_map_encoding[self.step].copy_(transition.height_map_encoding)
+            
+        if hasattr(transition, 'latent_vector') and transition.latent_vector is not None:
+            self.latent_vector[self.step].copy_(transition.latent_vector)
+            
+        if hasattr(transition, 'latent_mu') and transition.latent_mu is not None:
+            self.latent_mu[self.step].copy_(transition.latent_mu)
+            
+        if hasattr(transition, 'latent_logvar') and transition.latent_logvar is not None:
+            self.latent_logvar[self.step].copy_(transition.latent_logvar)
+            
+        if hasattr(transition, 'next_state_pred') and transition.next_state_pred is not None:
+            if self.next_state_pred is None:
+                self.next_state_pred = torch.zeros(
+                    self.num_transitions_per_env, 
+                    self.num_envs, 
+                    *transition.next_state_pred.shape[1:], 
+                    device=self.device
+                )
+            self.next_state_pred[self.step].copy_(transition.next_state_pred)
+        
+        # Store ground truth data if available
+        if hasattr(transition, 'true_velocity') and transition.true_velocity is not None:
+            self.true_velocity[self.step].copy_(transition.true_velocity)
+            self.has_true_velocity = True
+            
+        if hasattr(transition, 'true_foot_clearance') and transition.true_foot_clearance is not None:
+            self.true_foot_clearance[self.step].copy_(transition.true_foot_clearance)
+            self.has_true_foot_clearance = True
+            
+        if hasattr(transition, 'true_height_map') and transition.true_height_map is not None:
+            self.true_height_map[self.step].copy_(transition.true_height_map)
+            self.has_true_height_map = True
+            
+        if hasattr(transition, 'true_next_state') and transition.true_next_state is not None:
+            if self.true_next_state is None:
+                self.true_next_state = torch.zeros(
+                    self.num_transitions_per_env, 
+                    self.num_envs, 
+                    *transition.true_next_state.shape[1:], 
+                    device=self.device
+                )
+            self.true_next_state[self.step].copy_(transition.true_next_state)
+            self.has_true_next_state = True
+
+    def get_depth_images_batch(self, indices=None):
+        """Get a batch of depth images for training."""
+        if indices is None:
+            return self.depth_images.flatten(0, 1)
+        else:
+            return self.depth_images.flatten(0, 1)[indices]
+            
+    def get_prop_history_batch(self, indices=None):
+        """Get a batch of proprioceptive history for training."""
+        if indices is None:
+            return self.prop_history.flatten(0, 1)
+        else:
+            return self.prop_history.flatten(0, 1)[indices]
+    
+    def get_true_velocity_batch(self, indices=None):
+        """Get ground truth velocity for training if available."""
+        if not self.has_true_velocity:
+            # Return zeros if ground truth isn't available
+            batch_size = self.num_envs * self.num_transitions_per_env if indices is None else len(indices)
+            return torch.zeros(batch_size, self.true_velocity.size(-1), device=self.device)
+            
+        if indices is None:
+            return self.true_velocity.flatten(0, 1)
+        else:
+            return self.true_velocity.flatten(0, 1)[indices]
+    
+    def get_true_foot_clearance_batch(self, indices=None):
+        """Get ground truth foot clearance for training if available."""
+        if not self.has_true_foot_clearance:
+            batch_size = self.num_envs * self.num_transitions_per_env if indices is None else len(indices)
+            return torch.zeros(batch_size, self.true_foot_clearance.size(-1), device=self.device)
+            
+        if indices is None:
+            return self.true_foot_clearance.flatten(0, 1)
+        else:
+            return self.true_foot_clearance.flatten(0, 1)[indices]
+    
+    def get_true_height_map_batch(self, indices=None):
+        """Get ground truth height map for training if available."""
+        if not self.has_true_height_map:
+            batch_size = self.num_envs * self.num_transitions_per_env if indices is None else len(indices)
+            return torch.zeros(batch_size, self.true_height_map.size(-1), device=self.device)
+            
+        if indices is None:
+            return self.true_height_map.flatten(0, 1)
+        else:
+            return self.true_height_map.flatten(0, 1)[indices]
+    
+    def get_true_next_state_batch(self, indices=None):
+        """Get ground truth next state for training if available."""
+        if not self.has_true_next_state or self.true_next_state is None:
+            # This case needs special handling as we don't know the shape until runtime
+            if indices is None:
+                batch_size = self.num_envs * self.num_transitions_per_env
+            else:
+                batch_size = len(indices)
+                
+            # Estimate state dimension from observations if possible
+            if hasattr(self, 'observations') and self.observations is not None:
+                state_dim = self.observations.size(-1)
+                return torch.zeros(batch_size, state_dim, device=self.device)
+            else:
+                # If we can't determine the shape, return None
+                return None
+            
+        if indices is None:
+            return self.true_next_state.flatten(0, 1)
+        else:
+            return self.true_next_state.flatten(0, 1)[indices]
+    
+    def clear(self):
+        super().clear() 
+        
+        self.has_true_velocity = False
+        self.has_true_foot_clearance = False
+        self.has_true_height_map = False
+        self.has_true_next_state = False

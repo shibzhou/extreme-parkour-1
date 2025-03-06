@@ -36,7 +36,7 @@ from rsl_rl.modules import ActorCriticRMA
 from rsl_rl.storage import RolloutStorage
 import wandb
 from rsl_rl.utils import unpad_trajectories
-
+from rsl_rl.modules.actor_critic import PIEActorCritic
 
 class RMS(object):
     def __init__(self, device, epsilon=1e-4, shape=(1,)):
@@ -378,3 +378,298 @@ class PPO:
             reward = reward.mean(dim=1)  # (b1,)
         reward = torch.log(reward + 1.0)
         return reward
+
+class PIEPPO:
+    actor_critic: PIEActorCritic
+    
+    def __init__(self,
+                 actor_critic,
+                 num_learning_epochs=1,
+                 num_mini_batches=1,
+                 clip_param=0.2,
+                 gamma=0.998,
+                 lam=0.95,
+                 value_loss_coef=1.0,
+                 entropy_coef=0.0,
+                 learning_rate=1e-3,
+                 max_grad_norm=1.0,
+                 use_clipped_value_loss=True,
+                 schedule="fixed",
+                 desired_kl=0.01,
+                 device='cpu',
+                 # PIE-specific parameters
+                 velocity_loss_coef=1.0,
+                 foot_clearance_loss_coef=1.0,
+                 height_map_loss_coef=1.0,
+                 kl_loss_coef=0.1,
+                 next_state_loss_coef=1.0,
+                 **kwargs):
+        
+        self.device = device
+        self.desired_kl = desired_kl
+        self.schedule = schedule
+        self.learning_rate = learning_rate
+
+        self.actor_critic = actor_critic
+        self.actor_critic.to(self.device)
+        self.storage = None  
+        
+        self.optimizer = optim.Adam([
+            {'params': self.actor_critic.actor.parameters()},
+            {'params': self.actor_critic.critic.parameters()},
+            {'params': self.actor_critic.estimator.parameters()}
+        ], lr=learning_rate)
+        
+        self.transition = RolloutStorage.Transition()
+
+        # PPO parameters
+        self.clip_param = clip_param
+        self.num_learning_epochs = num_learning_epochs
+        self.num_mini_batches = num_mini_batches
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
+        self.gamma = gamma
+        self.lam = lam
+        self.max_grad_norm = max_grad_norm
+        self.use_clipped_value_loss = use_clipped_value_loss
+
+        # PIE-specific parameters
+        self.velocity_loss_coef = velocity_loss_coef
+        self.foot_clearance_loss_coef = foot_clearance_loss_coef
+        self.height_map_loss_coef = height_map_loss_coef
+        self.kl_loss_coef = kl_loss_coef
+        self.next_state_loss_coef = next_state_loss_coef
+
+    def init_storage(self, num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, action_shape):
+        """Initialize storage with PIE-specific buffers."""
+        # Create basic storage
+        self.storage = RolloutStorage(
+            num_envs, 
+            num_transitions_per_env, 
+            obs_shape, 
+            critic_obs_shape, 
+            action_shape, 
+            self.device
+        )
+        
+        # Initialize PIE-specific buffers
+        # These dimensions should come from your PIEActorCritic 
+        velocity_dim = getattr(self.actor_critic, 'velocity_dim', 3)
+        foot_clearance_dim = getattr(self.actor_critic, 'foot_clearance_dim', 4)
+        height_map_dim = getattr(self.actor_critic, 'height_map_dim', 32)
+        latent_dim = getattr(self.actor_critic, 'latent_dim', 32)
+        depth_shape = getattr(self.actor_critic, 'depth_shape', (58, 87))
+        
+        # Get history dimensions
+        hist_len = getattr(self.actor_critic, 'hist_len', 10)
+        num_proprio = getattr(self.actor_critic, 'num_proprio', obs_shape[0])
+        prop_history_shape = (hist_len, num_proprio)
+        
+        # Initialize PIE-specific buffers
+        self.storage.init_pie_buffers(
+            num_envs, 
+            num_transitions_per_env, 
+            depth_shape, 
+            prop_history_shape,
+            velocity_dim, 
+            foot_clearance_dim, 
+            height_map_dim, 
+            latent_dim
+        )
+
+    def test_mode(self):
+        self.actor_critic.eval()
+    
+    def train_mode(self):
+        self.actor_critic.train()
+
+    def act(self, proprio_obs, depth_images, prop_history, info=None):
+        """Get actions from the actor critic based on proprio observations, depth images and history."""
+        # Run the PIE estimator and actor
+        actions, base_velocity, foot_clearance, height_map_encoding, latent_vector = self.actor_critic.act(
+            proprio_obs, depth_images, prop_history, return_estimations=True
+        )
+        
+        self.transition.observations = proprio_obs
+        self.transition.depth_images = depth_images
+        self.transition.prop_history = prop_history
+        self.transition.actions = actions.detach()
+        
+        critic_observations = info.get("critic_observations", proprio_obs)
+        self.transition.values = self.actor_critic.evaluate(critic_observations).detach()
+        
+        # Get additional policy outputs for learning
+        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(actions).detach()
+        self.transition.action_mean = self.actor_critic.action_mean.detach()
+        self.transition.action_sigma = self.actor_critic.action_std.detach()
+        
+        # Store PIE-specific estimations
+        self.transition.base_velocity = base_velocity.detach()
+        self.transition.foot_clearance = foot_clearance.detach()
+        self.transition.height_map_encoding = height_map_encoding.detach()
+        self.transition.latent_vector = latent_vector.detach()
+        
+        return self.transition.actions
+    
+    def process_env_step(self, rewards, dones, infos):
+        """Process environment step and add to storage."""
+        rewards_total = rewards.clone()
+
+        self.transition.rewards = rewards_total.clone()
+        self.transition.dones = dones
+        
+        # Bootstrapping on time outs
+        if 'time_outs' in infos:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1
+            )
+
+        # Store actual ground truth values if available (for training the estimator)
+        if 'true_velocity' in infos:
+            self.transition.true_velocity = infos['true_velocity'].to(self.device)
+        if 'true_foot_clearance' in infos:
+            self.transition.true_foot_clearance = infos['true_foot_clearance'].to(self.device)
+        if 'true_height_map' in infos:
+            self.transition.true_height_map = infos['true_height_map'].to(self.device)
+        if 'next_state' in infos:
+            self.transition.true_next_state = infos['next_state'].to(self.device)
+
+        # Record the transition
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        
+        return rewards_total
+    
+    def compute_returns(self, last_critic_obs):
+        """Compute returns for advantage estimation."""
+        last_values = self.actor_critic.evaluate(last_critic_obs).detach()
+        self.storage.compute_returns(last_values, self.gamma, self.lam)
+    
+    def update(self):
+        mean_value_loss = 0
+        mean_surrogate_loss = 0
+        mean_velocity_loss = 0
+        mean_foot_clearance_loss = 0
+        mean_height_map_loss = 0
+        mean_kl_loss = 0
+        mean_next_state_loss = 0
+        
+        if self.actor_critic.is_recurrent:
+            generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        else:
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        
+        for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
+            old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            
+            # Get PIE-specific data for this batch
+            # Note: For mini-batch training, we need to match the indices
+            batch_indices = None  # The current mini-batch indices
+            
+            # If using mini-batches, extract the current indices
+            if hasattr(self.storage, 'current_indices') and self.storage.current_indices is not None:
+                batch_indices = self.storage.current_indices
+            
+            # Get batches with matching indices
+            depth_batch = self.storage.get_depth_images_batch(batch_indices)
+            prop_history_batch = self.storage.get_prop_history_batch(batch_indices)
+            true_velocity_batch = self.storage.get_true_velocity_batch(batch_indices)
+            true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(batch_indices)
+            true_height_map_batch = self.storage.get_true_height_map_batch(batch_indices)
+            true_next_state_batch = self.storage.get_true_next_state_batch(batch_indices)
+            
+
+            base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
+                self.actor_critic.estimator(depth_batch, prop_history_batch)
+            
+            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+            value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            entropy_batch = self.actor_critic.entropy
+
+            if self.desired_kl is not None and self.schedule == 'adaptive':
+                with torch.inference_mode():
+                    mu_batch = self.actor_critic.action_mean
+                    sigma_batch = self.actor_critic.action_std
+                    kl = torch.sum(
+                        torch.log(sigma_batch / old_sigma_batch + 1.e-5) + 
+                        (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / 
+                        (2.0 * torch.square(sigma_batch)) - 0.5, 
+                        axis=-1
+                    )
+                    kl_mean = torch.mean(kl)
+
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = self.learning_rate
+            
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
+            
+            # loss 
+            velocity_loss = F.mse_loss(base_velocity, true_velocity_batch)
+            foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance_batch)
+            height_map_loss = F.mse_loss(height_map_encoding, true_height_map_batch)
+            kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
+            next_state_loss = F.mse_loss(next_state_pred, true_next_state_batch)
+            
+            loss = surrogate_loss + \
+                   self.value_loss_coef * value_loss - \
+                   self.entropy_coef * entropy_batch.mean() + \
+                   self.velocity_loss_coef * velocity_loss + \
+                   self.foot_clearance_loss_coef * foot_clearance_loss + \
+                   self.height_map_loss_coef * height_map_loss + \
+                   self.kl_loss_coef * kl_loss + \
+                   self.next_state_loss_coef * next_state_loss
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_velocity_loss += velocity_loss.item()
+            mean_foot_clearance_loss += foot_clearance_loss.item()
+            mean_height_map_loss += height_map_loss.item()
+            mean_kl_loss += kl_loss.item()
+            mean_next_state_loss += next_state_loss.item()
+        
+        num_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_updates
+        mean_surrogate_loss /= num_updates
+        mean_velocity_loss /= num_updates
+        mean_foot_clearance_loss /= num_updates
+        mean_height_map_loss /= num_updates
+        mean_kl_loss /= num_updates
+        mean_next_state_loss /= num_updates
+
+        self.storage.clear()
+        
+        return {
+            'value_loss': mean_value_loss,
+            'surrogate_loss': mean_surrogate_loss,
+            'velocity_loss': mean_velocity_loss,
+            'foot_clearance_loss': mean_foot_clearance_loss,
+            'height_map_loss': mean_height_map_loss,
+            'kl_loss': mean_kl_loss,
+            'next_state_loss': mean_next_state_loss,
+            'learning_rate': self.learning_rate
+        }

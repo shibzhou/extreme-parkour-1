@@ -36,8 +36,9 @@ import torch.nn as nn
 from torch.distributions import Normal
 from torch.nn.modules import rnn
 from torch.nn.modules.activation import ReLU
-from pie_estimator import PIEEstimator
 import torch.nn.functional as F
+
+from .pie_estimator import PIEEstimator
 
 
 
