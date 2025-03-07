@@ -520,12 +520,21 @@ class PIEPPO:
         print(f"Initializing PIE storage with shapes: obs={obs_shape}, critic_obs={critic_obs_shape}, action={action_shape}")
         
         try:
+            # Make sure we're using the correct observation shape - only proprioceptive states
+            num_proprio = getattr(self.actor_critic, 'num_proprio', obs_shape[0])
+            
+            # If obs_shape is larger than num_proprio, we should use num_proprio instead
+            if obs_shape[0] > num_proprio:
+                print(f"WARNING: Observation shape {obs_shape[0]} is larger than proprioceptive size {num_proprio}")
+                print(f"Using only the proprioceptive part for storage")
+                obs_shape = [num_proprio]
+            
             # First create basic storage
             from rsl_rl.storage import RolloutStorage
             self.storage = RolloutStorage(
                 num_envs, 
                 num_transitions_per_env, 
-                obs_shape, 
+                obs_shape,  
                 critic_obs_shape, 
                 action_shape, 
                 self.device
@@ -547,7 +556,6 @@ class PIEPPO:
             
             # Get history dimensions
             hist_len = getattr(self.actor_critic, 'hist_len', 10)
-            num_proprio = getattr(self.actor_critic, 'num_proprio', obs_shape[0])
             prop_history_shape = (hist_len, num_proprio)
             
             # Add our memory-efficient extensions
@@ -1011,44 +1019,14 @@ class PIEPPO:
         print(f"  - Got base_velocity shape: {base_velocity.shape if base_velocity is not None else None}")
         
         # Initialize the transition object with observations
-        # If the storage expects full observations but we only have proprioceptive part,
-        # we need to manage this situation
-        if hasattr(self, 'storage') and self.storage is not None:
-            expected_obs_size = self.storage.observations.shape[1]
-            actual_obs_size = proprio_obs.shape[1]
-            
-            if expected_obs_size == actual_obs_size:
-                # Dimensions match, we can directly use proprio_obs
-                self.transition.observations = proprio_obs.clone()
-            else:
-                print(f"WARNING: Observation shape mismatch in act. Expected {expected_obs_size}, got {actual_obs_size}")
-                # Create padded observation with zeros
-                padded_obs = torch.zeros((proprio_obs.shape[0], expected_obs_size), device=proprio_obs.device)
-                # Copy the available proprio_obs data into the padded tensor
-                padded_obs[:, :actual_obs_size] = proprio_obs
-                self.transition.observations = padded_obs
-        else:
-            # Storage not initialized yet, just use what we have
-            self.transition.observations = proprio_obs.clone()
+        # Just use proprio_obs directly without attempting to pad it
+        self.transition.observations = proprio_obs.clone()
         
         # For critic observations, use privileged info if available, otherwise use proprio
         if info is not None and "critic_observations" in info and info["critic_observations"] is not None:
             self.transition.critic_observations = info["critic_observations"]
         else:
-            # If storage expects a different size than what we have, we need to handle it
-            if hasattr(self, 'storage') and self.storage is not None and hasattr(self.storage, 'critic_observations'):
-                if self.storage.critic_observations is not None:
-                    expected_critic_size = self.storage.critic_observations.shape[1]
-                    if expected_critic_size != proprio_obs.shape[1]:
-                        padded_critic = torch.zeros((proprio_obs.shape[0], expected_critic_size), device=proprio_obs.device)
-                        padded_critic[:, :proprio_obs.shape[1]] = proprio_obs
-                        self.transition.critic_observations = padded_critic
-                    else:
-                        self.transition.critic_observations = proprio_obs.clone()
-                else:
-                    self.transition.critic_observations = proprio_obs.clone()
-            else:
-                self.transition.critic_observations = proprio_obs.clone()
+            self.transition.critic_observations = proprio_obs.clone()
         
         # Store depth and history data 
         self.transition.depth_images = depth_images

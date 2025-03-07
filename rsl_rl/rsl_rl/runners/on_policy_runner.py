@@ -655,25 +655,12 @@ class OnPolicyRunner:
         else:
             depth_images = None
         
-        # Check if we need to rebuild the PIE storage with the correct dimensions
-        if obs.shape[1] != self.alg.storage.observations.shape[1]:
-            print(f"WARNING: Observation shape mismatch!")
-            print(f"Storage expects shape {self.alg.storage.observations.shape[1]} but actual obs is {obs.shape[1]}")
-            print("Rebuilding storage with correct dimensions...")
-            
-            # Reinitialize storage with the correct observation shape
-            self.alg.init_storage(
-                self.env.num_envs, 
-                self.num_steps_per_env, 
-                [obs.shape[1]],  # Use actual observation size
-                [critic_obs.shape[1]] if critic_obs is not None else None, 
-                [self.env.num_actions]
-            )
-            print(f"Storage rebuilt with observation shape: {self.alg.storage.observations.shape}")
-        
         # Initialize prop history - small tensor so can be on GPU
+        proprio_size = self.alg.actor_critic.num_proprio
+        print(f"Using proprioceptive size: {proprio_size}")
+        
         prop_history = torch.zeros(
-            (self.env.num_envs, self.alg.actor_critic.hist_len, self.alg.actor_critic.num_proprio), 
+            (self.env.num_envs, self.alg.actor_critic.hist_len, proprio_size), 
             device=self.device
         )
         
@@ -692,7 +679,7 @@ class OnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     # Update prop_history with current observation
                     prop_history = torch.roll(prop_history, shifts=-1, dims=1)
-                    prop_history[:, -1] = obs[:, :self.alg.actor_critic.num_proprio]
+                    prop_history[:, -1] = obs[:, :proprio_size]
                     
                     # Get actions from PIE actor critic using the alg.act method (NOT actor_critic.act directly)
                     info_dict = {"critic_observations": critic_obs}
@@ -701,8 +688,10 @@ class OnPolicyRunner:
                     depth_gpu = depth_images.to(self.device) if depth_images is not None else None
                     
                     # Call the alg.act method which populates the transition object
+                    # Only pass the proprioceptive part of the observations
+                    proprio_part = obs[:, :proprio_size]
                     actions = self.alg.act(
-                        obs[:, :self.alg.actor_critic.num_proprio], 
+                        proprio_part,
                         depth_gpu, 
                         prop_history,
                         info=info_dict
@@ -738,8 +727,8 @@ class OnPolicyRunner:
                         if 'episode' in infos:
                             ep_infos.append(infos['episode'])
                     
-                    # Always include next_state for successor prediction
-                    info_dict["next_state"] = next_obs[:, :self.alg.actor_critic.num_proprio]
+                    # Always include next_state for successor prediction - only proprioceptive part
+                    info_dict["next_state"] = next_obs[:, :proprio_size]
                     
                     # Process environment step
                     total_rew = self.alg.process_env_step(rewards, dones, info_dict)
