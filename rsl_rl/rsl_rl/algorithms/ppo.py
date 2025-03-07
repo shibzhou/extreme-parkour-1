@@ -124,7 +124,7 @@ class PPO:
         self.train_with_estimated_states = estimator_paras["train_with_estimated_states"]
 
         # Depth encoder
-        self.if_depth = depth_encoder != None
+        self.if_depth = depth_encoder is not None
         if self.if_depth:
             self.depth_encoder = depth_encoder
             self.depth_encoder_optimizer = optim.Adam(self.depth_encoder.parameters(), lr=depth_encoder_paras["learning_rate"])
@@ -133,7 +133,7 @@ class PPO:
             self.depth_actor_optimizer = optim.Adam([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], lr=depth_encoder_paras["learning_rate"])
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
-        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape,  critic_obs_shape, action_shape, self.device)
+        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
 
     def test_mode(self):
         self.actor_critic.test()
@@ -179,10 +179,9 @@ class PPO:
         return rewards_total
     
     def compute_returns(self, last_critic_obs):
-        last_values= self.actor_critic.evaluate(last_critic_obs).detach()
+        last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
     
-
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
@@ -258,7 +257,6 @@ class PPO:
                        self.value_loss_coef * value_loss - \
                        self.entropy_coef * entropy_batch.mean() + \
                        priv_reg_coef * priv_reg_loss
-                # loss = self.teacher_alpha * imitation_loss + (1 - self.teacher_alpha) * loss
 
                 # Gradient step
                 self.optimizer.zero_grad()
@@ -313,9 +311,8 @@ class PPO:
         return mean_hist_latent_loss
 
     def update_depth_encoder(self, depth_latent_batch, scandots_latent_batch):
-        # Depth encoder ditillation
+        # Depth encoder distillation
         if self.if_depth:
-            # TODO: needs to save hidden states
             depth_encoder_loss = (scandots_latent_batch.detach() - depth_latent_batch).norm(p=2, dim=1).mean()
 
             self.depth_encoder_optimizer.zero_grad()
@@ -323,6 +320,7 @@ class PPO:
             nn.utils.clip_grad_norm_(self.depth_encoder.parameters(), self.max_grad_norm)
             self.depth_encoder_optimizer.step()
             return depth_encoder_loss.item()
+        return 0.0
     
     def update_depth_actor(self, actions_student_batch, actions_teacher_batch, yaw_student_batch, yaw_teacher_batch):
         if self.if_depth:
@@ -336,6 +334,7 @@ class PPO:
             nn.utils.clip_grad_norm_(self.depth_actor.parameters(), self.max_grad_norm)
             self.depth_actor_optimizer.step()
             return depth_actor_loss.item(), yaw_loss.item()
+        return 0.0, 0.0
     
     def update_depth_both(self, depth_latent_batch, scandots_latent_batch, actions_student_batch, actions_teacher_batch):
         if self.if_depth:
@@ -349,37 +348,11 @@ class PPO:
             nn.utils.clip_grad_norm_([*self.depth_actor.parameters(), *self.depth_encoder.parameters()], self.max_grad_norm)
             self.depth_actor_optimizer.step()
             return depth_encoder_loss.item(), depth_actor_loss.item()
+        return 0.0, 0.0
     
     def update_counter(self):
         self.counter += 1
-    
-    def compute_apt_reward(self, source, target):
 
-        b1, b2 = source.size(0), target.size(0)
-        # (b1, 1, c) - (1, b2, c) -> (b1, 1, c) - (1, b2, c) -> (b1, b2, c) -> (b1, b2)
-        # sim_matrix = torch.norm(source[:, None, ::2].view(b1, 1, -1) - target[None, :, ::2].view(1, b2, -1), dim=-1, p=2)
-        # sim_matrix = torch.norm(source[:, None, :2].view(b1, 1, -1) - target[None, :, :2].view(1, b2, -1), dim=-1, p=2)
-        sim_matrix = torch.norm(source[:, None, :].view(b1, 1, -1) - target[None, :, :].view(1, b2, -1), dim=-1, p=2)
-
-        reward, _ = sim_matrix.topk(self.knn_k, dim=1, largest=False, sorted=True)  # (b1, k)
-
-        if not self.knn_avg:  # only keep k-th nearest neighbor
-            reward = reward[:, -1]
-            reward = reward.reshape(-1, 1)  # (b1, 1)
-            if self.rms:
-                moving_mean, moving_std = self.disc_state_rms(reward)
-                reward = reward / moving_std
-            reward = torch.clamp(reward - self.knn_clip, 0)  # (b1, )
-        else:  # average over all k nearest neighbors
-            reward = reward.reshape(-1, 1)  # (b1 * k, 1)
-            if self.rms:
-                moving_mean, moving_std = self.disc_state_rms(reward)
-                reward = reward / moving_std
-            reward = torch.clamp(reward - self.knn_clip, 0)
-            reward = reward.reshape((b1, self.knn_k))  # (b1, k)
-            reward = reward.mean(dim=1)  # (b1,)
-        reward = torch.log(reward + 1.0)
-        return reward
 
 class PIEPPO:
     actor_critic: PIEActorCritic
@@ -516,7 +489,7 @@ class PIEPPO:
         self.next_state_loss_coef = next_state_loss_coef
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, action_shape):
-        """Initialize storage with PIE-specific buffers - memory-efficient version."""
+        """Initialize storage with PIE-specific buffers."""
         print(f"Initializing PIE storage with shapes: obs={obs_shape}, critic_obs={critic_obs_shape}, action={action_shape}")
         
         try:
@@ -560,7 +533,7 @@ class PIEPPO:
             
             # Add our memory-efficient extensions
             print("Adding memory-efficient PIE buffer extensions to RolloutStorage")
-            self._init_pie_buffers_memory_efficient(
+            self._init_pie_buffers(
                 num_envs, 
                 num_transitions_per_env, 
                 depth_shape, 
@@ -586,7 +559,7 @@ class PIEPPO:
                     self.device
                 )
 
-    def _init_pie_buffers_memory_efficient(self, num_envs, num_transitions_per_env, depth_shape, prop_history_shape, 
+    def _init_pie_buffers(self, num_envs, num_transitions_per_env, depth_shape, prop_history_shape, 
                         velocity_dim, foot_clearance_dim, height_map_dim, latent_dim):
         """Memory-efficient implementation of storage extensions to avoid GPU OOM errors."""
         import types
@@ -645,16 +618,6 @@ class PIEPPO:
         self.storage.true_height_map = None
         self.storage.true_next_state = None
         
-        # Create Transition class extension if needed
-        if not hasattr(self.storage, 'Transition'):
-            # Create a basic Transition class for storing data
-            from collections import namedtuple
-            self.storage.Transition = namedtuple(
-                'Transition', 
-                ['observations', 'critic_observations', 'actions', 'rewards', 'dones', 
-                'actions_log_prob', 'action_mean', 'action_sigma']
-            )
-        
         # Add methods to the storage class
         def get_depth_images_batch(storage_self, indices=None):
             if not hasattr(storage_self, 'depth_images') or storage_self.depth_images is None:
@@ -712,9 +675,8 @@ class PIEPPO:
             else:
                 return storage_self.true_next_state.view(-1, storage_self.true_next_state.shape[-1])[indices]
         
-        # Create a properly scoped add_transitions method for the storage
-        # Rather than trying to use the class method directly
-        def storage_add_transitions(storage_self, transition):
+        # Define add_transitions method for storage
+        def pie_add_transitions(storage_self, transition):
             """Memory-efficient version of add_transitions that handles None values."""
             if storage_self.step >= storage_self.num_transitions_per_env:
                 storage_self.step = 0
@@ -728,10 +690,17 @@ class PIEPPO:
             
             # Handle critic observations - use observations as fallback
             if hasattr(transition, 'critic_observations') and transition.critic_observations is not None:
-                storage_self.critic_observations[storage_self.step].copy_(transition.critic_observations)
-            elif hasattr(storage_self, 'critic_observations') and storage_self.critic_observations is not None:
-                # If critic_observations is missing but required, copy from observations
-                storage_self.critic_observations[storage_self.step].copy_(transition.observations)
+                if hasattr(storage_self, 'privileged_observations') and storage_self.privileged_observations is not None:
+                    storage_self.privileged_observations[storage_self.step].copy_(transition.critic_observations)
+                elif hasattr(transition, 'critic_observations') and transition.critic_observations is not None:
+                    # Initialize privileged_observations if needed
+                    storage_self.privileged_observations = torch.zeros(
+                        storage_self.num_transitions_per_env,
+                        storage_self.num_envs,
+                        *transition.critic_observations.shape[1:],
+                        device=storage_self.device
+                    )
+                    storage_self.privileged_observations[storage_self.step].copy_(transition.critic_observations)
             
             # Validate required fields
             if not hasattr(transition, 'actions') or transition.actions is None:
@@ -752,8 +721,8 @@ class PIEPPO:
             storage_self.rewards[storage_self.step].copy_(transition.rewards.view(-1, 1))
             storage_self.dones[storage_self.step].copy_(transition.dones.view(-1, 1))
             storage_self.actions_log_prob[storage_self.step].copy_(transition.actions_log_prob.view(-1, 1))
-            storage_self.action_mean[storage_self.step].copy_(transition.action_mean)
-            storage_self.action_sigma[storage_self.step].copy_(transition.action_sigma)
+            storage_self.mu[storage_self.step].copy_(transition.action_mean)
+            storage_self.sigma[storage_self.step].copy_(transition.action_sigma)
             
             # Store PIE-specific data if available - with thorough validation
             if hasattr(storage_self, 'depth_images') and hasattr(transition, 'depth_images') and transition.depth_images is not None:
@@ -835,169 +804,8 @@ class PIEPPO:
         self.storage.get_true_height_map_batch = types.MethodType(get_true_height_map_batch, self.storage)
         self.storage.get_true_next_state_batch = types.MethodType(get_true_next_state_batch, self.storage)
         
-        # Bind our local add_transitions function to the storage object
-        # This avoids trying to use the class method directly which would cause
-        # argument count errors
-        self.storage.add_transitions = types.MethodType(storage_add_transitions, self.storage)
-        
-    def pie_add_transitions(storage_self, transition):
-        """Robust memory-efficient version of add_transitions that handles None values."""
-        if storage_self.step >= storage_self.num_transitions_per_env:
-            storage_self.step = 0
-        
-        # Validate inputs before copying to prevent null pointer errors
-        if not hasattr(transition, 'observations') or transition.observations is None:
-            raise ValueError("transition.observations cannot be None")
-        
-        # Store standard PPO values
-        storage_self.observations[storage_self.step].copy_(transition.observations)
-        
-        # Handle critic observations - use observations as fallback
-        if hasattr(transition, 'critic_observations') and transition.critic_observations is not None:
-            storage_self.critic_observations[storage_self.step].copy_(transition.critic_observations)
-        elif hasattr(storage_self, 'critic_observations') and storage_self.critic_observations is not None:
-            # If critic_observations is missing but required, copy from observations
-            storage_self.critic_observations[storage_self.step].copy_(transition.observations)
-        
-        # Validate required fields
-        if not hasattr(transition, 'actions') or transition.actions is None:
-            raise ValueError("transition.actions cannot be None")
-        if not hasattr(transition, 'rewards') or transition.rewards is None:
-            raise ValueError("transition.rewards cannot be None")
-        if not hasattr(transition, 'dones') or transition.dones is None:
-            raise ValueError("transition.dones cannot be None")
-        if not hasattr(transition, 'actions_log_prob') or transition.actions_log_prob is None:
-            raise ValueError("transition.actions_log_prob cannot be None")
-        if not hasattr(transition, 'action_mean') or transition.action_mean is None:
-            raise ValueError("transition.action_mean cannot be None")
-        if not hasattr(transition, 'action_sigma') or transition.action_sigma is None:
-            raise ValueError("transition.action_sigma cannot be None")
-        
-        # Copy required fields
-        storage_self.actions[storage_self.step].copy_(transition.actions)
-        storage_self.rewards[storage_self.step].copy_(transition.rewards.view(-1, 1))
-        storage_self.dones[storage_self.step].copy_(transition.dones.view(-1, 1))
-        storage_self.actions_log_prob[storage_self.step].copy_(transition.actions_log_prob.view(-1, 1))
-        storage_self.action_mean[storage_self.step].copy_(transition.action_mean)
-        storage_self.action_sigma[storage_self.step].copy_(transition.action_sigma)
-        
-        # Store PIE-specific data if available - with thorough validation
-        if hasattr(storage_self, 'depth_images') and hasattr(transition, 'depth_images') and transition.depth_images is not None:
-            # Move to CPU to save memory
-            cpu_depth = transition.depth_images if transition.depth_images.device.type == 'cpu' else transition.depth_images.cpu()
-            storage_self.depth_images[storage_self.step].copy_(cpu_depth)
-        
-        if hasattr(storage_self, 'prop_history') and hasattr(transition, 'prop_history') and transition.prop_history is not None:
-            # Convert to half precision
-            half_prop = transition.prop_history.half() if transition.prop_history.dtype != torch.float16 else transition.prop_history
-            storage_self.prop_history[storage_self.step].copy_(half_prop)
-        
-        if hasattr(storage_self, 'base_velocity') and hasattr(transition, 'base_velocity') and transition.base_velocity is not None:
-            storage_self.base_velocity[storage_self.step].copy_(transition.base_velocity)
-        
-        if hasattr(storage_self, 'foot_clearance') and hasattr(transition, 'foot_clearance') and transition.foot_clearance is not None:
-            storage_self.foot_clearance[storage_self.step].copy_(transition.foot_clearance)
-        
-        if hasattr(storage_self, 'height_map_encoding') and hasattr(transition, 'height_map_encoding') and transition.height_map_encoding is not None:
-            storage_self.height_map_encoding[storage_self.step].copy_(transition.height_map_encoding)
-        
-        if hasattr(storage_self, 'latent_vector') and hasattr(transition, 'latent_vector') and transition.latent_vector is not None:
-            storage_self.latent_vector[storage_self.step].copy_(transition.latent_vector)
-        
-        # Handle ground truth values if available
-        if hasattr(storage_self, 'true_velocity') and hasattr(transition, 'true_velocity') and transition.true_velocity is not None:
-            if storage_self.true_velocity is None:
-                # Initialize storage for true_velocity if not done yet
-                velocity_dim = transition.true_velocity.shape[-1]
-                storage_self.true_velocity = torch.zeros(
-                    storage_self.num_transitions_per_env, 
-                    storage_self.num_envs, 
-                    velocity_dim,
-                    device=storage_self.device
-                )
-            storage_self.true_velocity[storage_self.step].copy_(transition.true_velocity)
-        
-        if hasattr(storage_self, 'true_foot_clearance') and hasattr(transition, 'true_foot_clearance') and transition.true_foot_clearance is not None:
-            if storage_self.true_foot_clearance is None:
-                foot_clearance_dim = transition.true_foot_clearance.shape[-1]
-                storage_self.true_foot_clearance = torch.zeros(
-                    storage_self.num_transitions_per_env,
-                    storage_self.num_envs, 
-                    foot_clearance_dim,
-                    device=storage_self.device
-                )
-            storage_self.true_foot_clearance[storage_self.step].copy_(transition.true_foot_clearance)
-        
-        if hasattr(storage_self, 'true_height_map') and hasattr(transition, 'true_height_map') and transition.true_height_map is not None:
-            if storage_self.true_height_map is None:
-                height_map_dim = transition.true_height_map.shape[-1]
-                storage_self.true_height_map = torch.zeros(
-                    storage_self.num_transitions_per_env,
-                    storage_self.num_envs, 
-                    height_map_dim,
-                    device=storage_self.device
-                )
-            storage_self.true_height_map[storage_self.step].copy_(transition.true_height_map)
-        
-        if hasattr(storage_self, 'true_next_state') and hasattr(transition, 'true_next_state') and transition.true_next_state is not None:
-            if storage_self.true_next_state is None:
-                state_dim = transition.true_next_state.shape[-1]
-                storage_self.true_next_state = torch.zeros(
-                    storage_self.num_transitions_per_env,
-                    storage_self.num_envs, 
-                    state_dim,
-                    device=storage_self.device
-                )
-            storage_self.true_next_state[storage_self.step].copy_(transition.true_next_state)
-        
-        # Increment step
-        storage_self.step += 1
-        
-        # Replace add_transitions completely (don't rely on parent implementation)
+        # Bind our add_transitions function to the storage object
         self.storage.add_transitions = types.MethodType(pie_add_transitions, self.storage)
-
-    def process_env_step(self, rewards, dones, infos):
-        """Process environment step and add to storage - with safety checks."""
-        if self.storage is None:
-            raise RuntimeError("Storage has not been initialized. Call init_storage() before training.")
-            
-        rewards_total = rewards.clone()
-        
-        self.transition.rewards = rewards_total.clone()
-        self.transition.dones = dones
-        
-        # Bootstrapping on time outs
-        if isinstance(infos, dict) and 'time_outs' in infos:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1
-            )
-
-        # Store actual ground truth values if available (for training the estimator)
-        # Only set these if the values are not None
-        if isinstance(infos, dict):
-            if 'true_velocity' in infos and infos['true_velocity'] is not None:
-                self.transition.true_velocity = infos['true_velocity'].to(self.device)
-            
-            if 'true_foot_clearance' in infos and infos['true_foot_clearance'] is not None:
-                self.transition.true_foot_clearance = infos['true_foot_clearance'].to(self.device)
-            
-            if 'true_height_map' in infos and infos['true_height_map'] is not None:
-                self.transition.true_height_map = infos['true_height_map'].to(self.device)
-            
-            if 'next_state' in infos and infos['next_state'] is not None:
-                self.transition.true_next_state = infos['next_state'].to(self.device)
-
-        # Record the transition
-        self.storage.add_transitions(self.transition)
-        self.transition.clear()
-        
-        return rewards_total
-
-    def test_mode(self):
-        self.actor_critic.eval()
-    
-    def train_mode(self):
-        self.actor_critic.train()
 
     def act(self, proprio_obs, depth_images, prop_history, info=None):
         """Get actions from the actor critic based on proprio observations, depth images and history."""
@@ -1056,8 +864,11 @@ class PIEPPO:
     
     def process_env_step(self, rewards, dones, infos):
         """Process environment step and add to storage."""
+        if self.storage is None:
+            raise RuntimeError("Storage has not been initialized. Call init_storage() before training.")
+            
         rewards_total = rewards.clone()
-
+        
         self.transition.rewards = rewards_total.clone()
         self.transition.dones = dones
         
