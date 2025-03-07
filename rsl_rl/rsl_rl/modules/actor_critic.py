@@ -402,7 +402,8 @@ class PIEActorCritic(nn.Module):
 
         # PIE estimator
         output_dim_explicit = velocity_dim + foot_clearance_dim
-
+        self.num_proprio = num_proprio
+        self.hist_len = hist_len
         self.estimator = PIEEstimator(
             input_dim_prop=num_proprio,
             input_dim_depth=num_scan,

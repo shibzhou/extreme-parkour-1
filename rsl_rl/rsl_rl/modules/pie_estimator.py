@@ -77,10 +77,13 @@ class PIEEstimator(nn.Module):
         self.hidden_states = torch.zeros(1, batch_size, 512, device=device)
     
     def encode(self, depth_images, prop_history):
+        if depth_images is None:
+            batch_size = prop_history.shape[0]
+            # Adjust the shape (channels, height, width) to what your depth_encoder expects
+            depth_images = torch.zeros(batch_size, 2, 28, 28, device=prop_history.device)
+        
         batch_size = depth_images.shape[0]
-        
         depth_features = self.depth_encoder(depth_images)
-        
         prop_features = self.prop_encoder(prop_history.view(batch_size * self.hist_len, -1))
         prop_features = prop_features.view(batch_size, self.hist_len, -1)
         prop_features = prop_features[:, -1, :] 
