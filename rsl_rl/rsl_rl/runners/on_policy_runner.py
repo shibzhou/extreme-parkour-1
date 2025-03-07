@@ -644,11 +644,32 @@ class OnPolicyRunner:
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         
+        # Print observation sizes to help debug
+        print(f"Observation shape: {obs.shape}")
+        print(f"Critic observation shape: {critic_obs.shape if critic_obs is not None else None}")
+        print(f"Expected storage shape for observations: {self.alg.storage.observations.shape}")
+        
         # Initialize depth images - keep on CPU to save memory
         if hasattr(self.env, "depth_buffer"):
             depth_images = self.env.depth_buffer.clone()  # Keep on CPU
         else:
             depth_images = None
+        
+        # Check if we need to rebuild the PIE storage with the correct dimensions
+        if obs.shape[1] != self.alg.storage.observations.shape[1]:
+            print(f"WARNING: Observation shape mismatch!")
+            print(f"Storage expects shape {self.alg.storage.observations.shape[1]} but actual obs is {obs.shape[1]}")
+            print("Rebuilding storage with correct dimensions...")
+            
+            # Reinitialize storage with the correct observation shape
+            self.alg.init_storage(
+                self.env.num_envs, 
+                self.num_steps_per_env, 
+                [obs.shape[1]],  # Use actual observation size
+                [critic_obs.shape[1]] if critic_obs is not None else None, 
+                [self.env.num_actions]
+            )
+            print(f"Storage rebuilt with observation shape: {self.alg.storage.observations.shape}")
         
         # Initialize prop history - small tensor so can be on GPU
         prop_history = torch.zeros(
@@ -673,16 +694,18 @@ class OnPolicyRunner:
                     prop_history = torch.roll(prop_history, shifts=-1, dims=1)
                     prop_history[:, -1] = obs[:, :self.alg.actor_critic.num_proprio]
                     
-                    # Get actions from PIE actor critic
+                    # Get actions from PIE actor critic using the alg.act method (NOT actor_critic.act directly)
+                    info_dict = {"critic_observations": critic_obs}
+                    
                     # Move depth_images to GPU only when needed
                     depth_gpu = depth_images.to(self.device) if depth_images is not None else None
                     
-                    # Get actions and estimations
-                    actions, base_velocity, foot_clearance, height_map_encoding, latent_vector = self.alg.actor_critic.act(
+                    # Call the alg.act method which populates the transition object
+                    actions = self.alg.act(
                         obs[:, :self.alg.actor_critic.num_proprio], 
                         depth_gpu, 
                         prop_history,
-                        return_estimations=True
+                        info=info_dict
                     )
                     
                     # Free GPU memory

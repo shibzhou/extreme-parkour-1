@@ -457,27 +457,27 @@ class PIEPPO:
             return f"PIETransition({', '.join(fields)})"
 
     def __init__(self,
-                actor_critic,
-                num_learning_epochs=1,
-                num_mini_batches=1,
-                clip_param=0.2,
-                gamma=0.998,
-                lam=0.95,
-                value_loss_coef=1.0,
-                entropy_coef=0.0,
-                learning_rate=1e-3,
-                max_grad_norm=1.0,
-                use_clipped_value_loss=True,
-                schedule="fixed",
-                desired_kl=0.01,
-                device='cpu',
-                # PIE-specific parameters
-                velocity_loss_coef=1.0,
-                foot_clearance_loss_coef=1.0,
-                height_map_loss_coef=1.0,
-                kl_loss_coef=0.1,
-                next_state_loss_coef=1.0,
-                **kwargs):
+                 actor_critic,
+                 num_learning_epochs=1,
+                 num_mini_batches=1,
+                 clip_param=0.2,
+                 gamma=0.998,
+                 lam=0.95,
+                 value_loss_coef=1.0,
+                 entropy_coef=0.0,
+                 learning_rate=1e-3,
+                 max_grad_norm=1.0,
+                 use_clipped_value_loss=True,
+                 schedule="fixed",
+                 desired_kl=0.01,
+                 device='cpu',
+                 # PIE-specific parameters
+                 velocity_loss_coef=1.0,
+                 foot_clearance_loss_coef=1.0,
+                 height_map_loss_coef=1.0,
+                 kl_loss_coef=0.1,
+                 next_state_loss_coef=1.0,
+                 **kwargs):
         
         self.device = device
         self.desired_kl = desired_kl
@@ -494,7 +494,7 @@ class PIEPPO:
             {'params': self.actor_critic.estimator.parameters()}
         ], lr=learning_rate)
         
-        # Use our nested PIETransition class instead of importing
+        # Use our nested PIETransition class
         self.transition = self.PIETransition()
         
         # PPO parameters
@@ -579,7 +579,7 @@ class PIEPPO:
                 )
 
     def _init_pie_buffers_memory_efficient(self, num_envs, num_transitions_per_env, depth_shape, prop_history_shape, 
-                            velocity_dim, foot_clearance_dim, height_map_dim, latent_dim):
+                        velocity_dim, foot_clearance_dim, height_map_dim, latent_dim):
         """Memory-efficient implementation of storage extensions to avoid GPU OOM errors."""
         import types
         
@@ -704,8 +704,120 @@ class PIEPPO:
             else:
                 return storage_self.true_next_state.view(-1, storage_self.true_next_state.shape[-1])[indices]
         
-        # Use the pie_add_transitions method from this class
-        # instead of trying to import it from a non-existent module
+        # Create a properly scoped add_transitions method for the storage
+        # Rather than trying to use the class method directly
+        def storage_add_transitions(storage_self, transition):
+            """Memory-efficient version of add_transitions that handles None values."""
+            if storage_self.step >= storage_self.num_transitions_per_env:
+                storage_self.step = 0
+            
+            # Validate inputs before copying to prevent null pointer errors
+            if not hasattr(transition, 'observations') or transition.observations is None:
+                raise ValueError("transition.observations cannot be None")
+            
+            # Store standard PPO values
+            storage_self.observations[storage_self.step].copy_(transition.observations)
+            
+            # Handle critic observations - use observations as fallback
+            if hasattr(transition, 'critic_observations') and transition.critic_observations is not None:
+                storage_self.critic_observations[storage_self.step].copy_(transition.critic_observations)
+            elif hasattr(storage_self, 'critic_observations') and storage_self.critic_observations is not None:
+                # If critic_observations is missing but required, copy from observations
+                storage_self.critic_observations[storage_self.step].copy_(transition.observations)
+            
+            # Validate required fields
+            if not hasattr(transition, 'actions') or transition.actions is None:
+                raise ValueError("transition.actions cannot be None")
+            if not hasattr(transition, 'rewards') or transition.rewards is None:
+                raise ValueError("transition.rewards cannot be None")
+            if not hasattr(transition, 'dones') or transition.dones is None:
+                raise ValueError("transition.dones cannot be None")
+            if not hasattr(transition, 'actions_log_prob') or transition.actions_log_prob is None:
+                raise ValueError("transition.actions_log_prob cannot be None")
+            if not hasattr(transition, 'action_mean') or transition.action_mean is None:
+                raise ValueError("transition.action_mean cannot be None")
+            if not hasattr(transition, 'action_sigma') or transition.action_sigma is None:
+                raise ValueError("transition.action_sigma cannot be None")
+            
+            # Copy required fields
+            storage_self.actions[storage_self.step].copy_(transition.actions)
+            storage_self.rewards[storage_self.step].copy_(transition.rewards.view(-1, 1))
+            storage_self.dones[storage_self.step].copy_(transition.dones.view(-1, 1))
+            storage_self.actions_log_prob[storage_self.step].copy_(transition.actions_log_prob.view(-1, 1))
+            storage_self.action_mean[storage_self.step].copy_(transition.action_mean)
+            storage_self.action_sigma[storage_self.step].copy_(transition.action_sigma)
+            
+            # Store PIE-specific data if available - with thorough validation
+            if hasattr(storage_self, 'depth_images') and hasattr(transition, 'depth_images') and transition.depth_images is not None:
+                # Move to CPU to save memory
+                cpu_depth = transition.depth_images if transition.depth_images.device.type == 'cpu' else transition.depth_images.cpu()
+                storage_self.depth_images[storage_self.step].copy_(cpu_depth)
+            
+            if hasattr(storage_self, 'prop_history') and hasattr(transition, 'prop_history') and transition.prop_history is not None:
+                # Convert to half precision
+                half_prop = transition.prop_history.half() if transition.prop_history.dtype != torch.float16 else transition.prop_history
+                storage_self.prop_history[storage_self.step].copy_(half_prop)
+            
+            if hasattr(storage_self, 'base_velocity') and hasattr(transition, 'base_velocity') and transition.base_velocity is not None:
+                storage_self.base_velocity[storage_self.step].copy_(transition.base_velocity)
+            
+            if hasattr(storage_self, 'foot_clearance') and hasattr(transition, 'foot_clearance') and transition.foot_clearance is not None:
+                storage_self.foot_clearance[storage_self.step].copy_(transition.foot_clearance)
+            
+            if hasattr(storage_self, 'height_map_encoding') and hasattr(transition, 'height_map_encoding') and transition.height_map_encoding is not None:
+                storage_self.height_map_encoding[storage_self.step].copy_(transition.height_map_encoding)
+            
+            if hasattr(storage_self, 'latent_vector') and hasattr(transition, 'latent_vector') and transition.latent_vector is not None:
+                storage_self.latent_vector[storage_self.step].copy_(transition.latent_vector)
+            
+            # Handle ground truth values if available
+            if hasattr(storage_self, 'true_velocity') and hasattr(transition, 'true_velocity') and transition.true_velocity is not None:
+                if storage_self.true_velocity is None:
+                    # Initialize storage for true_velocity if not done yet
+                    velocity_dim = transition.true_velocity.shape[-1]
+                    storage_self.true_velocity = torch.zeros(
+                        storage_self.num_transitions_per_env, 
+                        storage_self.num_envs, 
+                        velocity_dim,
+                        device=storage_self.device
+                    )
+                storage_self.true_velocity[storage_self.step].copy_(transition.true_velocity)
+            
+            if hasattr(storage_self, 'true_foot_clearance') and hasattr(transition, 'true_foot_clearance') and transition.true_foot_clearance is not None:
+                if storage_self.true_foot_clearance is None:
+                    foot_clearance_dim = transition.true_foot_clearance.shape[-1]
+                    storage_self.true_foot_clearance = torch.zeros(
+                        storage_self.num_transitions_per_env,
+                        storage_self.num_envs, 
+                        foot_clearance_dim,
+                        device=storage_self.device
+                    )
+                storage_self.true_foot_clearance[storage_self.step].copy_(transition.true_foot_clearance)
+            
+            if hasattr(storage_self, 'true_height_map') and hasattr(transition, 'true_height_map') and transition.true_height_map is not None:
+                if storage_self.true_height_map is None:
+                    height_map_dim = transition.true_height_map.shape[-1]
+                    storage_self.true_height_map = torch.zeros(
+                        storage_self.num_transitions_per_env,
+                        storage_self.num_envs, 
+                        height_map_dim,
+                        device=storage_self.device
+                    )
+                storage_self.true_height_map[storage_self.step].copy_(transition.true_height_map)
+            
+            if hasattr(storage_self, 'true_next_state') and hasattr(transition, 'true_next_state') and transition.true_next_state is not None:
+                if storage_self.true_next_state is None:
+                    state_dim = transition.true_next_state.shape[-1]
+                    storage_self.true_next_state = torch.zeros(
+                        storage_self.num_transitions_per_env,
+                        storage_self.num_envs, 
+                        state_dim,
+                        device=storage_self.device
+                    )
+                storage_self.true_next_state[storage_self.step].copy_(transition.true_next_state)
+            
+            # Increment step
+            storage_self.step += 1
         
         # Bind the methods to the storage instance
         self.storage.get_depth_images_batch = types.MethodType(get_depth_images_batch, self.storage)
@@ -715,8 +827,11 @@ class PIEPPO:
         self.storage.get_true_height_map_batch = types.MethodType(get_true_height_map_batch, self.storage)
         self.storage.get_true_next_state_batch = types.MethodType(get_true_next_state_batch, self.storage)
         
-        # Bind the pie_add_transitions method directly from this class
-        self.storage.add_transitions = types.MethodType(self.pie_add_transitions, self.storage)
+        # Bind our local add_transitions function to the storage object
+        # This avoids trying to use the class method directly which would cause
+        # argument count errors
+        self.storage.add_transitions = types.MethodType(storage_add_transitions, self.storage)
+        
     def pie_add_transitions(storage_self, transition):
         """Robust memory-efficient version of add_transitions that handles None values."""
         if storage_self.step >= storage_self.num_transitions_per_env:
@@ -878,6 +993,8 @@ class PIEPPO:
 
     def act(self, proprio_obs, depth_images, prop_history, info=None):
         """Get actions from the actor critic based on proprio observations, depth images and history."""
+        print(f"ACT CALLED: proprio_obs shape = {proprio_obs.shape if proprio_obs is not None else None}")
+        
         # Clear any existing data in the transition
         self.transition.clear()
         
@@ -890,14 +1007,48 @@ class PIEPPO:
             proprio_obs, depth_images, prop_history, return_estimations=True
         )
         
+        print(f"  - Got actions shape: {actions.shape if actions is not None else None}")
+        print(f"  - Got base_velocity shape: {base_velocity.shape if base_velocity is not None else None}")
+        
         # Initialize the transition object with observations
-        self.transition.observations = proprio_obs.clone()
+        # If the storage expects full observations but we only have proprioceptive part,
+        # we need to manage this situation
+        if hasattr(self, 'storage') and self.storage is not None:
+            expected_obs_size = self.storage.observations.shape[1]
+            actual_obs_size = proprio_obs.shape[1]
+            
+            if expected_obs_size == actual_obs_size:
+                # Dimensions match, we can directly use proprio_obs
+                self.transition.observations = proprio_obs.clone()
+            else:
+                print(f"WARNING: Observation shape mismatch in act. Expected {expected_obs_size}, got {actual_obs_size}")
+                # Create padded observation with zeros
+                padded_obs = torch.zeros((proprio_obs.shape[0], expected_obs_size), device=proprio_obs.device)
+                # Copy the available proprio_obs data into the padded tensor
+                padded_obs[:, :actual_obs_size] = proprio_obs
+                self.transition.observations = padded_obs
+        else:
+            # Storage not initialized yet, just use what we have
+            self.transition.observations = proprio_obs.clone()
         
         # For critic observations, use privileged info if available, otherwise use proprio
         if info is not None and "critic_observations" in info and info["critic_observations"] is not None:
             self.transition.critic_observations = info["critic_observations"]
         else:
-            self.transition.critic_observations = proprio_obs.clone()
+            # If storage expects a different size than what we have, we need to handle it
+            if hasattr(self, 'storage') and self.storage is not None and hasattr(self.storage, 'critic_observations'):
+                if self.storage.critic_observations is not None:
+                    expected_critic_size = self.storage.critic_observations.shape[1]
+                    if expected_critic_size != proprio_obs.shape[1]:
+                        padded_critic = torch.zeros((proprio_obs.shape[0], expected_critic_size), device=proprio_obs.device)
+                        padded_critic[:, :proprio_obs.shape[1]] = proprio_obs
+                        self.transition.critic_observations = padded_critic
+                    else:
+                        self.transition.critic_observations = proprio_obs.clone()
+                else:
+                    self.transition.critic_observations = proprio_obs.clone()
+            else:
+                self.transition.critic_observations = proprio_obs.clone()
         
         # Store depth and history data 
         self.transition.depth_images = depth_images
@@ -919,12 +1070,9 @@ class PIEPPO:
         self.transition.latent_vector = latent_vector.detach()
         
         # Verify that all required fields are set
-        if self.transition.observations is None:
-            print("WARNING: transition.observations is None after setting")
-        if self.transition.critic_observations is None:
-            print("WARNING: transition.critic_observations is None after setting")
-        if self.transition.actions is None:
-            print("WARNING: transition.actions is None after setting")
+        print(f"  - Set transition.observations: {self.transition.observations is not None}, shape: {self.transition.observations.shape}")
+        print(f"  - Set transition.critic_observations: {self.transition.critic_observations is not None}, shape: {self.transition.critic_observations.shape if self.transition.critic_observations is not None else None}")
+        print(f"  - Set transition.actions: {self.transition.actions is not None}, shape: {self.transition.actions.shape if self.transition.actions is not None else None}")
         
         return self.transition.actions
     
