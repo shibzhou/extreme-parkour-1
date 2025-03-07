@@ -260,7 +260,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         logging_interval = 5
         save_interval = 1000  
         epoch_save_interval = 10
-        batch_size = 1024
+        batch_size = 256
         num_steps = 100
         num_training_iters = 10
         lr = 1e-3

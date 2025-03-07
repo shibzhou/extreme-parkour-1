@@ -622,7 +622,6 @@ class OnPolicyRunner:
 
     def learn_pie(self, num_learning_iterations, init_at_random_ep_len=False):
         """Memory-efficient training loop for the PIE framework."""
-        # Initialize tracking variables
         mean_value_loss = 0.
         mean_surrogate_loss = 0.
         mean_velocity_loss = 0.
@@ -631,31 +630,26 @@ class OnPolicyRunner:
         mean_kl_loss = 0.
         mean_next_state_loss = 0.
         
-        # Initialize buffers for tracking metrics
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Get initial observations
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         
-        # Print observation sizes to help debug
         print(f"Observation shape: {obs.shape}")
         print(f"Critic observation shape: {critic_obs.shape if critic_obs is not None else None}")
         print(f"Expected storage shape for observations: {self.alg.storage.observations.shape}")
         
-        # Initialize depth images - keep on CPU to save memory
         if hasattr(self.env, "depth_buffer"):
             depth_images = self.env.depth_buffer.clone()  # Keep on CPU
         else:
             depth_images = None
         
-        # Initialize prop history - small tensor so can be on GPU
         proprio_size = self.alg.actor_critic.num_proprio
         print(f"Using proprioceptive size: {proprio_size}")
         
@@ -664,10 +658,8 @@ class OnPolicyRunner:
             device=self.device
         )
         
-        # Set models to training mode
         self.alg.actor_critic.train()
-        
-        # Track iterations
+
         tot_iter = self.current_learning_iteration + num_learning_iterations
         self.start_learning_iteration = copy(self.current_learning_iteration)
 
@@ -681,14 +673,10 @@ class OnPolicyRunner:
                     prop_history = torch.roll(prop_history, shifts=-1, dims=1)
                     prop_history[:, -1] = obs[:, :proprio_size]
                     
-                    # Get actions from PIE actor critic using the alg.act method (NOT actor_critic.act directly)
                     info_dict = {"critic_observations": critic_obs}
                     
-                    # Move depth_images to GPU only when needed
                     depth_gpu = depth_images.to(self.device) if depth_images is not None else None
-                    
-                    # Call the alg.act method which populates the transition object
-                    # Only pass the proprioceptive part of the observations
+
                     proprio_part = obs[:, :proprio_size]
                     actions = self.alg.act(
                         proprio_part,
@@ -697,10 +685,8 @@ class OnPolicyRunner:
                         info=info_dict
                     )
                     
-                    # Free GPU memory
                     depth_gpu = None
                     
-                    # Step the environment
                     next_obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else next_obs
                     next_obs, critic_obs, rewards, dones = next_obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
@@ -709,13 +695,9 @@ class OnPolicyRunner:
                     if hasattr(self.env, "depth_buffer"):
                         depth_images = self.env.depth_buffer.clone()  # Keep on CPU
                     
-                    # Create info dictionary for training the estimator
-                    # Extract only what's needed to save memory
                     info_dict = {}
                     
-                    # Safely extract environment info - keep on CPU where possible
                     if isinstance(infos, dict):
-                        # Only extract what we need
                         if "true_velocity" in infos:
                             info_dict["true_velocity"] = infos["true_velocity"]
                         if "true_foot_clearance" in infos:
@@ -723,20 +705,15 @@ class OnPolicyRunner:
                         if "true_height_map" in infos:
                             info_dict["true_height_map"] = infos["true_height_map"]
                         
-                        # Store episode info for logging if available
                         if 'episode' in infos:
                             ep_infos.append(infos['episode'])
                     
-                    # Always include next_state for successor prediction - only proprioceptive part
                     info_dict["next_state"] = next_obs[:, :proprio_size]
                     
-                    # Process environment step
                     total_rew = self.alg.process_env_step(rewards, dones, info_dict)
                     
-                    # Update observations for next step
                     obs = next_obs
-                    
-                    # Bookkeeping
+
                     if self.log_dir is not None:
                         cur_reward_sum += total_rew
                         cur_episode_length += 1
@@ -750,12 +727,10 @@ class OnPolicyRunner:
                 
                 stop = time.time()
                 collection_time = stop - start
-                
-                # Compute returns for value function training
+
                 start = stop
                 self.alg.compute_returns(critic_obs)
             
-            # Update using PIEPPO
             update_results = self.alg.update()
             mean_value_loss = update_results['value_loss']
             mean_surrogate_loss = update_results['surrogate_loss']
@@ -767,18 +742,15 @@ class OnPolicyRunner:
             
             stop = time.time()
             learn_time = stop - start
-            
-            # Force garbage collection to free memory
+
             import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                
-            # Logging
+
             if self.log_dir is not None:
                 self.log_pie(locals())
-            
-            # Save model periodically - reduce frequency to save disk space
+
             if it < 2500:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
@@ -790,11 +762,9 @@ class OnPolicyRunner:
                     self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
             
             ep_infos.clear()
-        
-        # Save final model
+
         self.save(os.path.join(self.log_dir, f'model_{self.current_learning_iteration}.pt'))
     def log_pie(self, locs, width=80, pad=35):
-        """Logging method for PIE training."""
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs['collection_time'] + locs['learn_time']
         iteration_time = locs['collection_time'] + locs['learn_time']
@@ -802,7 +772,6 @@ class OnPolicyRunner:
         ep_string = f''
         wandb_dict = {}
         
-        # Log episode information
         if locs['ep_infos']:
             for key in locs['ep_infos'][0]:
                 infotensor = torch.tensor([], device=self.device)
