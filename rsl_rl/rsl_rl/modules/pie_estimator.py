@@ -17,6 +17,7 @@ class PIEEstimator(nn.Module):
         self.hist_len = hist_len
         self.input_dim_prop = input_dim_prop
         self.input_dim_depth = input_dim_depth
+        self.hidden_dim = hidden_dim
         
         self.depth_encoder = nn.Sequential(
             nn.Conv2d(2, 32, kernel_size=5, stride=2),
@@ -24,7 +25,7 @@ class PIEEstimator(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, stride=2),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64 * 13 * 20, 128),
+            nn.Linear(64 * 5 * 5, 128),
             nn.ReLU(),
             nn.Linear(128, hidden_dim // 2)
         )
@@ -35,8 +36,15 @@ class PIEEstimator(nn.Module):
             nn.Linear(128, hidden_dim // 2)
         )
         
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=8,
+            dim_feedforward=1024,
+            dropout=0.1,
+            batch_first=True
+        )
         self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, dim_feedforward=1024),
+            transformer_layer,
             num_layers=2
         )
 
@@ -62,7 +70,7 @@ class PIEEstimator(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 256),
             nn.ReLU(),
-            nn.Linear(256, output_dim_latent)
+            nn.Linear(256, output_dim_height_map)
         )
         
         self.successor_decoder = nn.Sequential(
