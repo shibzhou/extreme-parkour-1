@@ -31,6 +31,8 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+import types 
 
 from rsl_rl.modules import ActorCriticRMA
 from rsl_rl.storage import RolloutStorage
@@ -382,28 +384,100 @@ class PPO:
 class PIEPPO:
     actor_critic: PIEActorCritic
     
+    class PIETransition:
+        """Custom transition class for PIE algorithm."""
+        
+        def __init__(self):
+            # Standard PPO fields
+            self.observations = None
+            self.critic_observations = None
+            self.actions = None
+            self.rewards = None
+            self.dones = None
+            self.actions_log_prob = None
+            self.action_mean = None
+            self.action_sigma = None
+            self.values = None
+            
+            # PIE-specific fields
+            self.depth_images = None
+            self.prop_history = None
+            self.base_velocity = None
+            self.foot_clearance = None
+            self.height_map_encoding = None
+            self.latent_vector = None
+            
+            # Ground truth fields for estimator training
+            self.true_velocity = None
+            self.true_foot_clearance = None
+            self.true_height_map = None
+            self.true_next_state = None
+        
+        def clear(self):
+            """Reset all fields to None."""
+            # Standard PPO fields
+            self.observations = None
+            self.critic_observations = None
+            self.actions = None
+            self.rewards = None
+            self.dones = None
+            self.actions_log_prob = None
+            self.action_mean = None
+            self.action_sigma = None
+            self.values = None
+            
+            # PIE-specific fields
+            self.depth_images = None
+            self.prop_history = None
+            self.base_velocity = None
+            self.foot_clearance = None
+            self.height_map_encoding = None
+            self.latent_vector = None
+            
+            # Ground truth fields for estimator training
+            self.true_velocity = None
+            self.true_foot_clearance = None
+            self.true_height_map = None
+            self.true_next_state = None
+        
+        def __repr__(self):
+            """String representation for debugging."""
+            fields = []
+            if self.observations is not None:
+                fields.append(f"observations: tensor({self.observations.shape})")
+            if self.critic_observations is not None:
+                fields.append(f"critic_observations: tensor({self.critic_observations.shape})")
+            if self.actions is not None:
+                fields.append(f"actions: tensor({self.actions.shape})")
+            if self.depth_images is not None:
+                fields.append(f"depth_images: tensor({self.depth_images.shape})")
+            if self.prop_history is not None:
+                fields.append(f"prop_history: tensor({self.prop_history.shape})")
+            
+            return f"PIETransition({', '.join(fields)})"
+
     def __init__(self,
-                 actor_critic,
-                 num_learning_epochs=1,
-                 num_mini_batches=1,
-                 clip_param=0.2,
-                 gamma=0.998,
-                 lam=0.95,
-                 value_loss_coef=1.0,
-                 entropy_coef=0.0,
-                 learning_rate=1e-3,
-                 max_grad_norm=1.0,
-                 use_clipped_value_loss=True,
-                 schedule="fixed",
-                 desired_kl=0.01,
-                 device='cpu',
-                 # PIE-specific parameters
-                 velocity_loss_coef=1.0,
-                 foot_clearance_loss_coef=1.0,
-                 height_map_loss_coef=1.0,
-                 kl_loss_coef=0.1,
-                 next_state_loss_coef=1.0,
-                 **kwargs):
+                actor_critic,
+                num_learning_epochs=1,
+                num_mini_batches=1,
+                clip_param=0.2,
+                gamma=0.998,
+                lam=0.95,
+                value_loss_coef=1.0,
+                entropy_coef=0.0,
+                learning_rate=1e-3,
+                max_grad_norm=1.0,
+                use_clipped_value_loss=True,
+                schedule="fixed",
+                desired_kl=0.01,
+                device='cpu',
+                # PIE-specific parameters
+                velocity_loss_coef=1.0,
+                foot_clearance_loss_coef=1.0,
+                height_map_loss_coef=1.0,
+                kl_loss_coef=0.1,
+                next_state_loss_coef=1.0,
+                **kwargs):
         
         self.device = device
         self.desired_kl = desired_kl
@@ -420,8 +494,9 @@ class PIEPPO:
             {'params': self.actor_critic.estimator.parameters()}
         ], lr=learning_rate)
         
-        self.transition = RolloutStorage.Transition()
-
+        # Use our nested PIETransition class instead of importing
+        self.transition = self.PIETransition()
+        
         # PPO parameters
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
@@ -441,41 +516,359 @@ class PIEPPO:
         self.next_state_loss_coef = next_state_loss_coef
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, action_shape):
-        """Initialize storage with PIE-specific buffers."""
-        # Create basic storage
-        self.storage = RolloutStorage(
-            num_envs, 
+        """Initialize storage with PIE-specific buffers - memory-efficient version."""
+        print(f"Initializing PIE storage with shapes: obs={obs_shape}, critic_obs={critic_obs_shape}, action={action_shape}")
+        
+        try:
+            # First create basic storage
+            from rsl_rl.storage import RolloutStorage
+            self.storage = RolloutStorage(
+                num_envs, 
+                num_transitions_per_env, 
+                obs_shape, 
+                critic_obs_shape, 
+                action_shape, 
+                self.device
+            )
+            
+            # Initialize PIE-specific buffers from actor_critic parameters
+            velocity_dim = getattr(self.actor_critic, 'velocity_dim', 3)
+            foot_clearance_dim = getattr(self.actor_critic, 'foot_clearance_dim', 4)
+            height_map_dim = getattr(self.actor_critic, 'height_map_dim', 32)
+            latent_dim = getattr(self.actor_critic, 'latent_dim', 32)
+            
+            # Get dimensions for depth images - provide a default if not available
+            if hasattr(self.actor_critic, 'depth_shape'):
+                depth_shape = self.actor_critic.depth_shape
+            else:
+                # Use smaller default size to save memory
+                depth_shape = (28, 28)  # Reduced size from paper to save memory
+                print(f"Using reduced depth image shape: {depth_shape}")
+            
+            # Get history dimensions
+            hist_len = getattr(self.actor_critic, 'hist_len', 10)
+            num_proprio = getattr(self.actor_critic, 'num_proprio', obs_shape[0])
+            prop_history_shape = (hist_len, num_proprio)
+            
+            # Add our memory-efficient extensions
+            print("Adding memory-efficient PIE buffer extensions to RolloutStorage")
+            self._init_pie_buffers_memory_efficient(
+                num_envs, 
+                num_transitions_per_env, 
+                depth_shape, 
+                prop_history_shape,
+                velocity_dim, 
+                foot_clearance_dim, 
+                height_map_dim, 
+                latent_dim
+            )
+            print("Memory-efficient PIE buffers initialized successfully")
+            
+        except Exception as e:
+            print(f"Error initializing PIE buffers: {e}")
+            # At minimum, make sure basic storage is initialized
+            if self.storage is None:
+                from rsl_rl.storage import RolloutStorage
+                self.storage = RolloutStorage(
+                    num_envs, 
+                    num_transitions_per_env, 
+                    obs_shape, 
+                    critic_obs_shape, 
+                    action_shape, 
+                    self.device
+                )
+
+    def _init_pie_buffers_memory_efficient(self, num_envs, num_transitions_per_env, depth_shape, prop_history_shape, 
+                            velocity_dim, foot_clearance_dim, height_map_dim, latent_dim):
+        """Memory-efficient implementation of storage extensions to avoid GPU OOM errors."""
+        import types
+        
+        # Initialize buffers on the storage object - using CPU for larger tensors
+        self.storage.depth_images = torch.zeros(
             num_transitions_per_env, 
-            obs_shape, 
-            critic_obs_shape, 
-            action_shape, 
-            self.device
+            num_envs, 
+            2,  # Assuming 2-channel depth
+            depth_shape[0], 
+            depth_shape[1], 
+            device="cpu"  # Store on CPU to save GPU memory
         )
         
-        # Initialize PIE-specific buffers
-        # These dimensions should come from your PIEActorCritic 
-        velocity_dim = getattr(self.actor_critic, 'velocity_dim', 3)
-        foot_clearance_dim = getattr(self.actor_critic, 'foot_clearance_dim', 4)
-        height_map_dim = getattr(self.actor_critic, 'height_map_dim', 32)
-        latent_dim = getattr(self.actor_critic, 'latent_dim', 32)
-        depth_shape = getattr(self.actor_critic, 'depth_shape', (58, 87))
-        
-        # Get history dimensions
-        hist_len = getattr(self.actor_critic, 'hist_len', 10)
-        num_proprio = getattr(self.actor_critic, 'num_proprio', obs_shape[0])
-        prop_history_shape = (hist_len, num_proprio)
-        
-        # Initialize PIE-specific buffers
-        self.storage.init_pie_buffers(
-            num_envs, 
-            num_transitions_per_env, 
-            depth_shape, 
-            prop_history_shape,
-            velocity_dim, 
-            foot_clearance_dim, 
-            height_map_dim, 
-            latent_dim
+        self.storage.prop_history = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            prop_history_shape[0],  # hist_len
+            prop_history_shape[1],  # num_proprio
+            dtype=torch.float16,  # Use half precision to save memory
+            device=self.device
         )
+        
+        # For storing estimated values
+        self.storage.base_velocity = torch.zeros(
+            num_transitions_per_env,
+            num_envs, 
+            velocity_dim,
+            device=self.device
+        )
+        
+        self.storage.foot_clearance = torch.zeros(
+            num_transitions_per_env,
+            num_envs, 
+            foot_clearance_dim,
+            device=self.device
+        )
+        
+        self.storage.height_map_encoding = torch.zeros(
+            num_transitions_per_env,
+            num_envs, 
+            height_map_dim,
+            device=self.device
+        )
+        
+        self.storage.latent_vector = torch.zeros(
+            num_transitions_per_env,
+            num_envs, 
+            latent_dim,
+            device=self.device
+        )
+        
+        # Initialize ground truth value buffers to None (will create when needed)
+        self.storage.true_velocity = None
+        self.storage.true_foot_clearance = None
+        self.storage.true_height_map = None
+        self.storage.true_next_state = None
+        
+        # Create Transition class extension if needed
+        if not hasattr(self.storage, 'Transition'):
+            # Create a basic Transition class for storing data
+            from collections import namedtuple
+            self.storage.Transition = namedtuple(
+                'Transition', 
+                ['observations', 'critic_observations', 'actions', 'rewards', 'dones', 
+                'actions_log_prob', 'action_mean', 'action_sigma']
+            )
+        
+        # Add methods to the storage class
+        def get_depth_images_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'depth_images') or storage_self.depth_images is None:
+                return None
+                
+            if indices is None:
+                # Get all data
+                depth_batch = storage_self.depth_images.view(-1, *storage_self.depth_images.shape[2:])
+            else:
+                # Get specific indices
+                depth_batch = storage_self.depth_images.view(-1, *storage_self.depth_images.shape[2:])[indices]
+            # Move to GPU for processing
+            return depth_batch.to(storage_self.device)
+        
+        def get_prop_history_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'prop_history') or storage_self.prop_history is None:
+                return None
+                
+            if indices is None:
+                prop_batch = storage_self.prop_history.view(-1, *storage_self.prop_history.shape[2:])
+            else:
+                prop_batch = storage_self.prop_history.view(-1, *storage_self.prop_history.shape[2:])[indices]
+            # Convert back to full precision
+            return prop_batch.float()
+        
+        def get_true_velocity_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'true_velocity') or storage_self.true_velocity is None:
+                return None
+            if indices is None:
+                return storage_self.true_velocity.view(-1, storage_self.true_velocity.shape[-1])
+            else:
+                return storage_self.true_velocity.view(-1, storage_self.true_velocity.shape[-1])[indices]
+        
+        def get_true_foot_clearance_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'true_foot_clearance') or storage_self.true_foot_clearance is None:
+                return None
+            if indices is None:
+                return storage_self.true_foot_clearance.view(-1, storage_self.true_foot_clearance.shape[-1])
+            else:
+                return storage_self.true_foot_clearance.view(-1, storage_self.true_foot_clearance.shape[-1])[indices]
+        
+        def get_true_height_map_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'true_height_map') or storage_self.true_height_map is None:
+                return None
+            if indices is None:
+                return storage_self.true_height_map.view(-1, storage_self.true_height_map.shape[-1])
+            else:
+                return storage_self.true_height_map.view(-1, storage_self.true_height_map.shape[-1])[indices]
+        
+        def get_true_next_state_batch(storage_self, indices=None):
+            if not hasattr(storage_self, 'true_next_state') or storage_self.true_next_state is None:
+                return None
+            if indices is None:
+                return storage_self.true_next_state.view(-1, storage_self.true_next_state.shape[-1])
+            else:
+                return storage_self.true_next_state.view(-1, storage_self.true_next_state.shape[-1])[indices]
+        
+        # Use the pie_add_transitions method from this class
+        # instead of trying to import it from a non-existent module
+        
+        # Bind the methods to the storage instance
+        self.storage.get_depth_images_batch = types.MethodType(get_depth_images_batch, self.storage)
+        self.storage.get_prop_history_batch = types.MethodType(get_prop_history_batch, self.storage)
+        self.storage.get_true_velocity_batch = types.MethodType(get_true_velocity_batch, self.storage)
+        self.storage.get_true_foot_clearance_batch = types.MethodType(get_true_foot_clearance_batch, self.storage)
+        self.storage.get_true_height_map_batch = types.MethodType(get_true_height_map_batch, self.storage)
+        self.storage.get_true_next_state_batch = types.MethodType(get_true_next_state_batch, self.storage)
+        
+        # Bind the pie_add_transitions method directly from this class
+        self.storage.add_transitions = types.MethodType(self.pie_add_transitions, self.storage)
+    def pie_add_transitions(storage_self, transition):
+        """Robust memory-efficient version of add_transitions that handles None values."""
+        if storage_self.step >= storage_self.num_transitions_per_env:
+            storage_self.step = 0
+        
+        # Validate inputs before copying to prevent null pointer errors
+        if not hasattr(transition, 'observations') or transition.observations is None:
+            raise ValueError("transition.observations cannot be None")
+        
+        # Store standard PPO values
+        storage_self.observations[storage_self.step].copy_(transition.observations)
+        
+        # Handle critic observations - use observations as fallback
+        if hasattr(transition, 'critic_observations') and transition.critic_observations is not None:
+            storage_self.critic_observations[storage_self.step].copy_(transition.critic_observations)
+        elif hasattr(storage_self, 'critic_observations') and storage_self.critic_observations is not None:
+            # If critic_observations is missing but required, copy from observations
+            storage_self.critic_observations[storage_self.step].copy_(transition.observations)
+        
+        # Validate required fields
+        if not hasattr(transition, 'actions') or transition.actions is None:
+            raise ValueError("transition.actions cannot be None")
+        if not hasattr(transition, 'rewards') or transition.rewards is None:
+            raise ValueError("transition.rewards cannot be None")
+        if not hasattr(transition, 'dones') or transition.dones is None:
+            raise ValueError("transition.dones cannot be None")
+        if not hasattr(transition, 'actions_log_prob') or transition.actions_log_prob is None:
+            raise ValueError("transition.actions_log_prob cannot be None")
+        if not hasattr(transition, 'action_mean') or transition.action_mean is None:
+            raise ValueError("transition.action_mean cannot be None")
+        if not hasattr(transition, 'action_sigma') or transition.action_sigma is None:
+            raise ValueError("transition.action_sigma cannot be None")
+        
+        # Copy required fields
+        storage_self.actions[storage_self.step].copy_(transition.actions)
+        storage_self.rewards[storage_self.step].copy_(transition.rewards.view(-1, 1))
+        storage_self.dones[storage_self.step].copy_(transition.dones.view(-1, 1))
+        storage_self.actions_log_prob[storage_self.step].copy_(transition.actions_log_prob.view(-1, 1))
+        storage_self.action_mean[storage_self.step].copy_(transition.action_mean)
+        storage_self.action_sigma[storage_self.step].copy_(transition.action_sigma)
+        
+        # Store PIE-specific data if available - with thorough validation
+        if hasattr(storage_self, 'depth_images') and hasattr(transition, 'depth_images') and transition.depth_images is not None:
+            # Move to CPU to save memory
+            cpu_depth = transition.depth_images if transition.depth_images.device.type == 'cpu' else transition.depth_images.cpu()
+            storage_self.depth_images[storage_self.step].copy_(cpu_depth)
+        
+        if hasattr(storage_self, 'prop_history') and hasattr(transition, 'prop_history') and transition.prop_history is not None:
+            # Convert to half precision
+            half_prop = transition.prop_history.half() if transition.prop_history.dtype != torch.float16 else transition.prop_history
+            storage_self.prop_history[storage_self.step].copy_(half_prop)
+        
+        if hasattr(storage_self, 'base_velocity') and hasattr(transition, 'base_velocity') and transition.base_velocity is not None:
+            storage_self.base_velocity[storage_self.step].copy_(transition.base_velocity)
+        
+        if hasattr(storage_self, 'foot_clearance') and hasattr(transition, 'foot_clearance') and transition.foot_clearance is not None:
+            storage_self.foot_clearance[storage_self.step].copy_(transition.foot_clearance)
+        
+        if hasattr(storage_self, 'height_map_encoding') and hasattr(transition, 'height_map_encoding') and transition.height_map_encoding is not None:
+            storage_self.height_map_encoding[storage_self.step].copy_(transition.height_map_encoding)
+        
+        if hasattr(storage_self, 'latent_vector') and hasattr(transition, 'latent_vector') and transition.latent_vector is not None:
+            storage_self.latent_vector[storage_self.step].copy_(transition.latent_vector)
+        
+        # Handle ground truth values if available
+        if hasattr(storage_self, 'true_velocity') and hasattr(transition, 'true_velocity') and transition.true_velocity is not None:
+            if storage_self.true_velocity is None:
+                # Initialize storage for true_velocity if not done yet
+                velocity_dim = transition.true_velocity.shape[-1]
+                storage_self.true_velocity = torch.zeros(
+                    storage_self.num_transitions_per_env, 
+                    storage_self.num_envs, 
+                    velocity_dim,
+                    device=storage_self.device
+                )
+            storage_self.true_velocity[storage_self.step].copy_(transition.true_velocity)
+        
+        if hasattr(storage_self, 'true_foot_clearance') and hasattr(transition, 'true_foot_clearance') and transition.true_foot_clearance is not None:
+            if storage_self.true_foot_clearance is None:
+                foot_clearance_dim = transition.true_foot_clearance.shape[-1]
+                storage_self.true_foot_clearance = torch.zeros(
+                    storage_self.num_transitions_per_env,
+                    storage_self.num_envs, 
+                    foot_clearance_dim,
+                    device=storage_self.device
+                )
+            storage_self.true_foot_clearance[storage_self.step].copy_(transition.true_foot_clearance)
+        
+        if hasattr(storage_self, 'true_height_map') and hasattr(transition, 'true_height_map') and transition.true_height_map is not None:
+            if storage_self.true_height_map is None:
+                height_map_dim = transition.true_height_map.shape[-1]
+                storage_self.true_height_map = torch.zeros(
+                    storage_self.num_transitions_per_env,
+                    storage_self.num_envs, 
+                    height_map_dim,
+                    device=storage_self.device
+                )
+            storage_self.true_height_map[storage_self.step].copy_(transition.true_height_map)
+        
+        if hasattr(storage_self, 'true_next_state') and hasattr(transition, 'true_next_state') and transition.true_next_state is not None:
+            if storage_self.true_next_state is None:
+                state_dim = transition.true_next_state.shape[-1]
+                storage_self.true_next_state = torch.zeros(
+                    storage_self.num_transitions_per_env,
+                    storage_self.num_envs, 
+                    state_dim,
+                    device=storage_self.device
+                )
+            storage_self.true_next_state[storage_self.step].copy_(transition.true_next_state)
+        
+        # Increment step
+        storage_self.step += 1
+        
+        # Replace add_transitions completely (don't rely on parent implementation)
+        self.storage.add_transitions = types.MethodType(pie_add_transitions, self.storage)
+
+    def process_env_step(self, rewards, dones, infos):
+        """Process environment step and add to storage - with safety checks."""
+        if self.storage is None:
+            raise RuntimeError("Storage has not been initialized. Call init_storage() before training.")
+            
+        rewards_total = rewards.clone()
+        
+        self.transition.rewards = rewards_total.clone()
+        self.transition.dones = dones
+        
+        # Bootstrapping on time outs
+        if isinstance(infos, dict) and 'time_outs' in infos:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1
+            )
+
+        # Store actual ground truth values if available (for training the estimator)
+        # Only set these if the values are not None
+        if isinstance(infos, dict):
+            if 'true_velocity' in infos and infos['true_velocity'] is not None:
+                self.transition.true_velocity = infos['true_velocity'].to(self.device)
+            
+            if 'true_foot_clearance' in infos and infos['true_foot_clearance'] is not None:
+                self.transition.true_foot_clearance = infos['true_foot_clearance'].to(self.device)
+            
+            if 'true_height_map' in infos and infos['true_height_map'] is not None:
+                self.transition.true_height_map = infos['true_height_map'].to(self.device)
+            
+            if 'next_state' in infos and infos['next_state'] is not None:
+                self.transition.true_next_state = infos['next_state'].to(self.device)
+
+        # Record the transition
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        
+        return rewards_total
 
     def test_mode(self):
         self.actor_critic.eval()
@@ -485,29 +878,53 @@ class PIEPPO:
 
     def act(self, proprio_obs, depth_images, prop_history, info=None):
         """Get actions from the actor critic based on proprio observations, depth images and history."""
+        # Clear any existing data in the transition
+        self.transition.clear()
+        
+        # Make sure we're dealing with tensors
+        if proprio_obs is None:
+            raise ValueError("proprio_obs cannot be None")
+        
         # Run the PIE estimator and actor
         actions, base_velocity, foot_clearance, height_map_encoding, latent_vector = self.actor_critic.act(
             proprio_obs, depth_images, prop_history, return_estimations=True
         )
         
-        self.transition.observations = proprio_obs
+        # Initialize the transition object with observations
+        self.transition.observations = proprio_obs.clone()
+        
+        # For critic observations, use privileged info if available, otherwise use proprio
+        if info is not None and "critic_observations" in info and info["critic_observations"] is not None:
+            self.transition.critic_observations = info["critic_observations"]
+        else:
+            self.transition.critic_observations = proprio_obs.clone()
+        
+        # Store depth and history data 
         self.transition.depth_images = depth_images
         self.transition.prop_history = prop_history
+        
+        # Store action data
         self.transition.actions = actions.detach()
-        
-        critic_observations = info.get("critic_observations", proprio_obs)
-        self.transition.values = self.actor_critic.evaluate(critic_observations).detach()
-        
-        # Get additional policy outputs for learning
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        
+        # Get value estimate
+        self.transition.values = self.actor_critic.evaluate(self.transition.critic_observations).detach()
         
         # Store PIE-specific estimations
         self.transition.base_velocity = base_velocity.detach()
         self.transition.foot_clearance = foot_clearance.detach()
         self.transition.height_map_encoding = height_map_encoding.detach()
         self.transition.latent_vector = latent_vector.detach()
+        
+        # Verify that all required fields are set
+        if self.transition.observations is None:
+            print("WARNING: transition.observations is None after setting")
+        if self.transition.critic_observations is None:
+            print("WARNING: transition.critic_observations is None after setting")
+        if self.transition.actions is None:
+            print("WARNING: transition.actions is None after setting")
         
         return self.transition.actions
     
@@ -519,20 +936,25 @@ class PIEPPO:
         self.transition.dones = dones
         
         # Bootstrapping on time outs
-        if 'time_outs' in infos:
+        if isinstance(infos, dict) and 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1
             )
 
         # Store actual ground truth values if available (for training the estimator)
-        if 'true_velocity' in infos:
-            self.transition.true_velocity = infos['true_velocity'].to(self.device)
-        if 'true_foot_clearance' in infos:
-            self.transition.true_foot_clearance = infos['true_foot_clearance'].to(self.device)
-        if 'true_height_map' in infos:
-            self.transition.true_height_map = infos['true_height_map'].to(self.device)
-        if 'next_state' in infos:
-            self.transition.true_next_state = infos['next_state'].to(self.device)
+        # Only set these if the values are not None
+        if isinstance(infos, dict):
+            if 'true_velocity' in infos and infos['true_velocity'] is not None:
+                self.transition.true_velocity = infos['true_velocity'].to(self.device)
+            
+            if 'true_foot_clearance' in infos and infos['true_foot_clearance'] is not None:
+                self.transition.true_foot_clearance = infos['true_foot_clearance'].to(self.device)
+            
+            if 'true_height_map' in infos and infos['true_height_map'] is not None:
+                self.transition.true_height_map = infos['true_height_map'].to(self.device)
+            
+            if 'next_state' in infos and infos['next_state'] is not None:
+                self.transition.true_next_state = infos['next_state'].to(self.device)
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -546,6 +968,7 @@ class PIEPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
     
     def update(self):
+        """Update policy and estimator using PPO algorithm."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_velocity_loss = 0
@@ -573,19 +996,23 @@ class PIEPPO:
             # Get batches with matching indices
             depth_batch = self.storage.get_depth_images_batch(batch_indices)
             prop_history_batch = self.storage.get_prop_history_batch(batch_indices)
+            
+            # Get ground truth values for estimator training (if available)
             true_velocity_batch = self.storage.get_true_velocity_batch(batch_indices)
             true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(batch_indices)
             true_height_map_batch = self.storage.get_true_height_map_batch(batch_indices)
             true_next_state_batch = self.storage.get_true_next_state_batch(batch_indices)
             
-
+            # Run estimator forward pass
             base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
                 self.actor_critic.estimator(depth_batch, prop_history_batch)
             
+            # Get policy outputs
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-            value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1] if hid_states_batch is not None else None)
             entropy_batch = self.actor_critic.entropy
 
+            # Handle adaptive learning rate if needed
             if self.desired_kl is not None and self.schedule == 'adaptive':
                 with torch.inference_mode():
                     mu_batch = self.actor_critic.action_mean
@@ -606,6 +1033,7 @@ class PIEPPO:
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = self.learning_rate
             
+            # Calculate PPO surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
@@ -613,6 +1041,7 @@ class PIEPPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
+            # Calculate value function loss
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
@@ -623,13 +1052,30 @@ class PIEPPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
             
-            # loss 
-            velocity_loss = F.mse_loss(base_velocity, true_velocity_batch)
-            foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance_batch)
-            height_map_loss = F.mse_loss(height_map_encoding, true_height_map_batch)
-            kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
-            next_state_loss = F.mse_loss(next_state_pred, true_next_state_batch)
+            # Calculate estimator losses - ensure we only calculate losses for data we have
+            velocity_loss = torch.tensor(0.0, device=self.device)
+            foot_clearance_loss = torch.tensor(0.0, device=self.device)
+            height_map_loss = torch.tensor(0.0, device=self.device)
+            next_state_loss = torch.tensor(0.0, device=self.device)
             
+            # Only calculate losses if ground truth data is available
+            if true_velocity_batch is not None:
+                velocity_loss = F.mse_loss(base_velocity, true_velocity_batch)
+            
+            if true_foot_clearance_batch is not None:
+                foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance_batch)
+            
+            if true_height_map_batch is not None:
+                height_map_loss = F.mse_loss(height_map_encoding, true_height_map_batch)
+            
+            if true_next_state_batch is not None:
+                next_state_loss = F.mse_loss(next_state_pred, true_next_state_batch)
+            
+            # Calculate KL loss for VAE
+            kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
+            kl_loss = kl_loss / latent_mu.size(0)  # Normalize by batch size
+            
+            # Combine all losses
             loss = surrogate_loss + \
                    self.value_loss_coef * value_loss - \
                    self.entropy_coef * entropy_batch.mean() + \
@@ -639,11 +1085,13 @@ class PIEPPO:
                    self.kl_loss_coef * kl_loss + \
                    self.next_state_loss_coef * next_state_loss
             
+            # Optimize
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             
+            # Track losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_velocity_loss += velocity_loss.item()
@@ -652,6 +1100,7 @@ class PIEPPO:
             mean_kl_loss += kl_loss.item()
             mean_next_state_loss += next_state_loss.item()
         
+        # Calculate means
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
@@ -660,9 +1109,11 @@ class PIEPPO:
         mean_height_map_loss /= num_updates
         mean_kl_loss /= num_updates
         mean_next_state_loss /= num_updates
-
+        
+        # Clear storage for next update
         self.storage.clear()
         
+        # Return mean losses
         return {
             'value_loss': mean_value_loss,
             'surrogate_loss': mean_surrogate_loss,

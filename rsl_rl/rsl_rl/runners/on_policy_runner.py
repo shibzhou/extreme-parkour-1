@@ -52,12 +52,14 @@ from rsl_rl.algorithms.ppo import PIEPPO
 
 class OnPolicyRunner:
 
+# Update the OnPolicyRunner class to properly initialize storage for PIE
+
     def __init__(self,
-                 env: VecEnv,
-                 train_cfg,
-                 log_dir=None,
-                 init_wandb=True,
-                 device='cpu', **kwargs):
+                env: VecEnv,
+                train_cfg,
+                log_dir=None,
+                init_wandb=True,
+                device='cpu', **kwargs):
 
         self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
@@ -67,62 +69,42 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
 
-        print("Using MLP and Priviliged Env encoder ActorCritic structure")
-        actor_critic: ActorCriticRMA = ActorCriticRMA(self.env.cfg.env.n_proprio,
-                                                      self.env.cfg.env.n_scan,
-                                                      self.env.num_obs,
-                                                      self.env.cfg.env.n_priv_latent,
-                                                      self.env.cfg.env.n_priv,
-                                                      self.env.cfg.env.history_len,
-                                                      self.env.num_actions,
-                                                      **self.policy_cfg).to(self.device)
-        estimator = Estimator(input_dim=env.cfg.env.n_proprio, output_dim=env.cfg.env.n_priv, hidden_dims=self.estimator_cfg["hidden_dims"]).to(self.device)
-        # Depth encoder
-        self.if_depth = self.depth_encoder_cfg["if_depth"]
-        if self.if_depth:
-            depth_backbone = DepthOnlyFCBackbone58x87(env.cfg.env.n_proprio, 
-                                                    self.policy_cfg["scan_encoder_dims"][-1], 
-                                                    self.depth_encoder_cfg["hidden_dims"],
-                                                    )
-            depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg).to(self.device)
-            depth_actor = deepcopy(actor_critic.actor)
-        else:
-            depth_encoder = None
-            depth_actor = None
-        # self.depth_encoder = depth_encoder
-        # self.depth_encoder_optimizer = optim.Adam(self.depth_encoder.parameters(), lr=self.depth_encoder_cfg["learning_rate"])
-        # self.depth_encoder_paras = self.depth_encoder_cfg
-        # self.depth_encoder_criterion = nn.MSELoss()
-        # Create algorithm
-        alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
-        self.alg: PPO = alg_class(actor_critic, 
-                                  estimator, self.estimator_cfg, 
-                                  depth_encoder, self.depth_encoder_cfg, depth_actor,
-                                  device=self.device, **self.alg_cfg)
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
-        self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]
-
-        self.alg.init_storage(
-            self.env.num_envs, 
-            self.num_steps_per_env, 
-            [self.env.num_obs], 
-            [self.env.num_privileged_obs], 
-            [self.env.num_actions],
-        )
-
-        self.learn = self.learn_RL if not self.if_depth else self.learn_vision
-            
-        # Log
-        self.log_dir = log_dir
-        self.writer = None
-        self.tot_timesteps = 0
-        self.tot_time = 0
-        self.current_learning_iteration = 0
-
         # Check if we're using PIE mode
         self.use_pie = train_cfg.get("use_pie", False)
-        if self.use_pie:
+        
+        if not self.use_pie:
+            print("Using MLP and Priviliged Env encoder ActorCritic structure")
+            actor_critic: ActorCriticRMA = ActorCriticRMA(self.env.cfg.env.n_proprio,
+                                                    self.env.cfg.env.n_scan,
+                                                    self.env.num_obs,
+                                                    self.env.cfg.env.n_priv_latent,
+                                                    self.env.cfg.env.n_priv,
+                                                    self.env.cfg.env.history_len,
+                                                    self.env.num_actions,
+                                                    **self.policy_cfg).to(self.device)
+            estimator = Estimator(input_dim=env.cfg.env.n_proprio, output_dim=env.cfg.env.n_priv, hidden_dims=self.estimator_cfg["hidden_dims"]).to(self.device)
+            # Depth encoder
+            self.if_depth = self.depth_encoder_cfg["if_depth"]
+            if self.if_depth:
+                depth_backbone = DepthOnlyFCBackbone58x87(env.cfg.env.n_proprio, 
+                                                        self.policy_cfg["scan_encoder_dims"][-1], 
+                                                        self.depth_encoder_cfg["hidden_dims"],
+                                                        )
+                depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg).to(self.device)
+                depth_actor = deepcopy(actor_critic.actor)
+            else:
+                depth_encoder = None
+                depth_actor = None
+            
+            # Create algorithm
+            alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
+            self.alg: PPO = alg_class(actor_critic, 
+                                estimator, self.estimator_cfg, 
+                                depth_encoder, self.depth_encoder_cfg, depth_actor,
+                                device=self.device, **self.alg_cfg)
+            
+            self.learn = self.learn_RL if not self.if_depth else self.learn_vision
+        else:
             print("Using PIE (Parkour with Implicit-Explicit learning) Actor-Critic structure")
             actor_critic = PIEActorCritic(
                 num_proprio=self.env.cfg.env.n_proprio,
@@ -164,9 +146,42 @@ class OnPolicyRunner:
                 kl_loss_coef=self.alg_cfg.get("kl_loss_coef", 0.1),
                 next_state_loss_coef=self.alg_cfg.get("next_state_loss_coef", 1.0)
             )
+            
             # Replace the learn method with PIE-specific implementation
             self.learn = self.learn_pie
+
+        # Initialize storage regardless of which algorithm type
+        self.num_steps_per_env = self.cfg["num_steps_per_env"]
+        self.save_interval = self.cfg["save_interval"]
+        self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]
+
+        # Initialize storage with appropriate shape based on algorithm type
+        if self.use_pie:
+            # Initialize PIE-specific storage with extra buffers
+            self.alg.init_storage(
+                self.env.num_envs, 
+                self.num_steps_per_env, 
+                [self.env.num_obs], 
+                [self.env.num_privileged_obs], 
+                [self.env.num_actions]
+            )
+        else:
+            # Initialize standard PPO storage
+            self.alg.init_storage(
+                self.env.num_envs, 
+                self.num_steps_per_env, 
+                [self.env.num_obs], 
+                [self.env.num_privileged_obs], 
+                [self.env.num_actions]
+            )
                 
+        # Log
+        self.log_dir = log_dir
+        self.writer = None
+        self.tot_timesteps = 0
+        self.tot_time = 0
+        self.current_learning_iteration = 0
+                    
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.
@@ -606,7 +621,7 @@ class OnPolicyRunner:
         return self.alg.discriminator.inference
 
     def learn_pie(self, num_learning_iterations, init_at_random_ep_len=False):
-        """Training loop for the PIE (Parkour with Implicit-Explicit learning) framework."""
+        """Memory-efficient training loop for the PIE framework."""
         # Initialize tracking variables
         mean_value_loss = 0.
         mean_surrogate_loss = 0.
@@ -629,10 +644,17 @@ class OnPolicyRunner:
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         
-        # Initialize depth and prop history buffers
-        depth_images = self.env.depth_buffer.clone().to(self.device) if hasattr(self.env, "depth_buffer") else None
-        prop_history = torch.zeros((self.env.num_envs, self.alg.actor_critic.hist_len, self.alg.actor_critic.num_proprio), 
-                                device=self.device)
+        # Initialize depth images - keep on CPU to save memory
+        if hasattr(self.env, "depth_buffer"):
+            depth_images = self.env.depth_buffer.clone()  # Keep on CPU
+        else:
+            depth_images = None
+        
+        # Initialize prop history - small tensor so can be on GPU
+        prop_history = torch.zeros(
+            (self.env.num_envs, self.alg.actor_critic.hist_len, self.alg.actor_critic.num_proprio), 
+            device=self.device
+        )
         
         # Set models to training mode
         self.alg.actor_critic.train()
@@ -652,29 +674,49 @@ class OnPolicyRunner:
                     prop_history[:, -1] = obs[:, :self.alg.actor_critic.num_proprio]
                     
                     # Get actions from PIE actor critic
+                    # Move depth_images to GPU only when needed
+                    depth_gpu = depth_images.to(self.device) if depth_images is not None else None
+                    
+                    # Get actions and estimations
                     actions, base_velocity, foot_clearance, height_map_encoding, latent_vector = self.alg.actor_critic.act(
                         obs[:, :self.alg.actor_critic.num_proprio], 
-                        depth_images, 
+                        depth_gpu, 
                         prop_history,
                         return_estimations=True
                     )
+                    
+                    # Free GPU memory
+                    depth_gpu = None
                     
                     # Step the environment
                     next_obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else next_obs
                     next_obs, critic_obs, rewards, dones = next_obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
                     
-                    # Get new depth images
+                    # Get new depth images - keep on CPU to save memory
                     if hasattr(self.env, "depth_buffer"):
-                        depth_images = self.env.depth_buffer.clone().to(self.device)
+                        depth_images = self.env.depth_buffer.clone()  # Keep on CPU
                     
-                    # Extract ground truth for training the estimator if available
-                    info_dict = {
-                        "true_velocity": infos.get("true_velocity", None),
-                        "true_foot_clearance": infos.get("true_foot_clearance", None),
-                        "true_height_map": infos.get("true_height_map", None),
-                        "next_state": next_obs[:, :self.alg.actor_critic.num_proprio]  # Use the next proprio state as target
-                    }
+                    # Create info dictionary for training the estimator
+                    # Extract only what's needed to save memory
+                    info_dict = {}
+                    
+                    # Safely extract environment info - keep on CPU where possible
+                    if isinstance(infos, dict):
+                        # Only extract what we need
+                        if "true_velocity" in infos:
+                            info_dict["true_velocity"] = infos["true_velocity"]
+                        if "true_foot_clearance" in infos:
+                            info_dict["true_foot_clearance"] = infos["true_foot_clearance"]
+                        if "true_height_map" in infos:
+                            info_dict["true_height_map"] = infos["true_height_map"]
+                        
+                        # Store episode info for logging if available
+                        if 'episode' in infos:
+                            ep_infos.append(infos['episode'])
+                    
+                    # Always include next_state for successor prediction
+                    info_dict["next_state"] = next_obs[:, :self.alg.actor_critic.num_proprio]
                     
                     # Process environment step
                     total_rew = self.alg.process_env_step(rewards, dones, info_dict)
@@ -684,16 +726,15 @@ class OnPolicyRunner:
                     
                     # Bookkeeping
                     if self.log_dir is not None:
-                        if 'episode' in infos:
-                            ep_infos.append(infos['episode'])
                         cur_reward_sum += total_rew
                         cur_episode_length += 1
                         
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
+                        if new_ids.size(0) > 0:
+                            rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_reward_sum[new_ids] = 0
+                            cur_episode_length[new_ids] = 0
                 
                 stop = time.time()
                 collection_time = stop - start
@@ -715,11 +756,17 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             
+            # Force garbage collection to free memory
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
             # Logging
             if self.log_dir is not None:
                 self.log_pie(locals())
             
-            # Save model periodically
+            # Save model periodically - reduce frequency to save disk space
             if it < 2500:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f'model_{it}.pt'))
@@ -734,7 +781,6 @@ class OnPolicyRunner:
         
         # Save final model
         self.save(os.path.join(self.log_dir, f'model_{self.current_learning_iteration}.pt'))
-
     def log_pie(self, locs, width=80, pad=35):
         """Logging method for PIE training."""
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
