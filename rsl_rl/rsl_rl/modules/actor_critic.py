@@ -384,6 +384,8 @@ class PIEActor(nn.Module):
         return actions
 
 class PIEActorCritic(nn.Module):
+    is_recurrent = False  # Add this attribute so PPO.update() can check it
+    
     def __init__(self,
                 num_proprio,
                 num_scan,
@@ -393,17 +395,23 @@ class PIEActorCritic(nn.Module):
                 height_map_dim=32,
                 latent_dim=32,
                 hist_len=10,
-                num_actions=2,
+                num_actions=12,  # Default to 12 for quadruped robots (3 joints × 4 legs)
                 actor_hidden_dims=[512, 256, 128],
                 critic_hidden_dims=[512, 256, 128],
                 activation='elu',
                 init_noise_std=1.0):
         super(PIEActorCritic, self).__init__()
 
-        # PIE estimator
-        output_dim_explicit = velocity_dim + foot_clearance_dim
+        # Store dimensions as class attributes for later use
         self.num_proprio = num_proprio
+        self.velocity_dim = velocity_dim
+        self.foot_clearance_dim = foot_clearance_dim
+        self.height_map_dim = height_map_dim
+        self.latent_dim = latent_dim
         self.hist_len = hist_len
+        self.num_actions = num_actions
+
+        # PIE estimator
         self.estimator = PIEEstimator(
             input_dim_prop=num_proprio,
             input_dim_depth=num_scan,
@@ -414,6 +422,7 @@ class PIEActorCritic(nn.Module):
             hidden_dim=512,
             hist_len=hist_len
         )
+        
         # Actor
         self.actor = PIEActor(
             num_proprio=num_proprio,
@@ -426,7 +435,7 @@ class PIEActorCritic(nn.Module):
             activation=activation
         )
         
-        # same critic as in ActorCriticRMA
+        # Critic - same as in ActorCriticRMA
         activation_fn = get_activation(activation)
         critic_layers = []
         critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
@@ -446,11 +455,13 @@ class PIEActorCritic(nn.Module):
         Normal.set_default_validate_args = False
         
     def act(self, proprio_obs, depth_images, prop_history, return_estimations=False):
-        # Run the estimator
-        base_velocity, foot_clearance, height_map_encoding, latent_vector, _, _, _ = self.estimator(
+        """Get actions from the actor critic based on proprio obs, depth images and history."""
+        # Run the PIE estimator to get the state estimations
+        base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = self.estimator(
             depth_images, prop_history
         )
         
+        # Get actions using the actor with the estimated states
         actions_mean = self.actor(
             proprio_obs, 
             base_velocity, 
@@ -459,7 +470,10 @@ class PIEActorCritic(nn.Module):
             latent_vector
         )
         
+        # Create distribution using the mean and std parameter
         self.distribution = Normal(actions_mean, self.std)
+        
+        # Sample actions from the distribution
         actions = self.distribution.sample()
         
         if return_estimations:
@@ -468,7 +482,7 @@ class PIEActorCritic(nn.Module):
             return actions
             
     def act_inference(self, proprio_obs, depth_images, prop_history):
-
+        """Inference mode (no sampling)"""
         with torch.no_grad():
             base_velocity, foot_clearance, height_map_encoding, latent_vector, _, _, _ = self.estimator(
                 depth_images, prop_history
@@ -485,61 +499,40 @@ class PIEActorCritic(nn.Module):
         return actions
     
     def evaluate(self, critic_obs):
+        """Get the value estimate from the critic network"""
         value = self.critic(critic_obs)
         return value
     
     def get_actions_log_prob(self, actions):
+        """Get log probabilities of actions from the current distribution"""
         return self.distribution.log_prob(actions).sum(dim=-1)
     
-    def compute_pie_loss(self, estimator_outputs, ground_truth):
-        """
-        Compute the PIE loss as defined in the paper
-        """
-        # estimator outputs
-        base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = estimator_outputs
-        
-        # ground truth
-        true_velocity, true_foot_clearance, true_height_map, true_next_state = ground_truth
-        
-        # KL divergence loss for VAE (latent vector)
-        kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
-        
-        # MSE losses for reconstructions and estimations
-        velocity_loss = F.mse_loss(base_velocity, true_velocity)
-        foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance)
-        height_map_loss = F.mse_loss(height_map_encoding, true_height_map)
-        next_state_loss = F.mse_loss(next_state_pred, true_next_state)
-        
-        total_loss = kl_loss + velocity_loss + foot_clearance_loss + height_map_loss + next_state_loss
-        
-        return total_loss, {
-            'kl_loss': kl_loss.item(),
-            'velocity_loss': velocity_loss.item(),
-            'foot_clearance_loss': foot_clearance_loss.item(),
-            'height_map_loss': height_map_loss.item(),
-            'next_state_loss': next_state_loss.item()
-        }
-
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [torch.nn.init.orthogonal_(module.weight, gain=scales[idx]) for idx, module in
-         enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
-
     def reset(self, dones=None):
-        pass
-
-    def forward(self):
-        raise NotImplementedError
+        """Method to reset internal states if needed between episodes"""
+        # Reset the estimator GRU hidden states if they exist
+        if hasattr(self.estimator, 'hidden_states') and self.estimator.hidden_states is not None:
+            if dones is not None:
+                # Reset only environments that are done
+                mask = ~dones.bool().squeeze()
+                batch_size = self.estimator.hidden_states.size(1)
+                if mask.shape[0] < batch_size:  # Handle case with fewer dones than batch size
+                    mask = torch.cat([mask, mask.new_ones(batch_size - mask.shape[0])])
+                self.estimator.hidden_states[:, mask] = 0.0
+            else:
+                # Reset all environments
+                self.estimator.hidden_states = None
     
     @property
     def action_mean(self):
+        """Return the mean of the current action distribution"""
         return self.distribution.mean
 
     @property
     def action_std(self):
+        """Return the std of the current action distribution"""
         return self.distribution.stddev
     
     @property
     def entropy(self):
+        """Return the entropy of the current action distribution"""
         return self.distribution.entropy().sum(dim=-1)
