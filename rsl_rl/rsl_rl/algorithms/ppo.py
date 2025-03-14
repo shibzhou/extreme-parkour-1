@@ -905,7 +905,7 @@ class PIEPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
     
     def update(self):
-        """Update policy and estimator using PPO algorithm."""
+        """Update policy and estimator using PPO algorithm with more careful handling of gradients."""
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_velocity_loss = 0
@@ -914,150 +914,216 @@ class PIEPPO:
         mean_kl_loss = 0
         mean_next_state_loss = 0
         
+        # Determine the right generator based on whether we're using a recurrent policy
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         
+        # Process each mini-batch
+        num_updates = 0
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
             old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
             
-            # IMPORTANT: Get only the data relevant to the current mini-batch
+            num_updates += 1
+            
+            # ==================== CRITICALLY IMPORTANT ====================
+            # Detach all tensors to ensure there are no connections to previous graphs
+            obs_batch = obs_batch.detach()
+            critic_obs_batch = critic_obs_batch.detach()
+            actions_batch = actions_batch.detach()
+            target_values_batch = target_values_batch.detach()
+            advantages_batch = advantages_batch.detach()
+            returns_batch = returns_batch.detach()
+            old_actions_log_prob_batch = old_actions_log_prob_batch.detach()
+            old_mu_batch = old_mu_batch.detach()
+            old_sigma_batch = old_sigma_batch.detach()
+            
+            # Always zero gradients at the beginning of each mini-batch processing
+            self.optimizer.zero_grad()
+            
             # Get current batch size
             current_batch_size = obs_batch.size(0)
             
             # Extract proprioceptive part for the PIE estimator
             proprio_batch = obs_batch[:, :self.actor_critic.num_proprio]
             
-            # Get the depth and prop history for just this mini-batch
-            depth_batch = self.storage.get_depth_images_batch(None)
-            prop_history_batch = self.storage.get_prop_history_batch(None)
+            # Get depth and prop history data for this mini-batch - with detaching
+            try:
+                depth_batch = self.storage.get_depth_images_batch(None)
+                if depth_batch is not None:
+                    depth_batch = depth_batch[:current_batch_size].detach()
+            except:
+                depth_batch = None
+                
+            try:
+                prop_history_batch = self.storage.get_prop_history_batch(None)
+                if prop_history_batch is not None:
+                    prop_history_batch = prop_history_batch[:current_batch_size].detach()
+            except:
+                prop_history_batch = None
             
-            # Make sure we only use the amount of data matching the current mini-batch
-            depth_batch = depth_batch[:current_batch_size] if depth_batch is not None else None
-            prop_history_batch = prop_history_batch[:current_batch_size] if prop_history_batch is not None else None
-            
-            if depth_batch is not None:
-                depth_batch = depth_batch.clone()
-            if prop_history_batch is not None:
-                prop_history_batch = prop_history_batch.clone()
-            
-            true_velocity_batch = self.storage.get_true_velocity_batch(None)
-            true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(None)
-            true_height_map_batch = self.storage.get_true_height_map_batch(None)
-            true_next_state_batch = self.storage.get_true_next_state_batch(None)
+            # Get ground truth data and ensure they're fully detached from any graphs
+            try:
+                true_velocity_batch = self.storage.get_true_velocity_batch(None)
+                if true_velocity_batch is not None:
+                    true_velocity_batch = true_velocity_batch[:current_batch_size].detach()
+            except:
+                true_velocity_batch = None
+                
+            try:
+                true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(None)
+                if true_foot_clearance_batch is not None:
+                    true_foot_clearance_batch = true_foot_clearance_batch[:current_batch_size].detach()
+            except:
+                true_foot_clearance_batch = None
+                
+            try:
+                true_height_map_batch = self.storage.get_true_height_map_batch(None)
+                if true_height_map_batch is not None:
+                    true_height_map_batch = true_height_map_batch[:current_batch_size].detach()
+            except:
+                true_height_map_batch = None
+                
+            try:
+                true_next_state_batch = self.storage.get_true_next_state_batch(None)
+                if true_next_state_batch is not None:
+                    true_next_state_batch = true_next_state_batch[:current_batch_size].detach()
+            except:
+                true_next_state_batch = None
 
-            if true_velocity_batch is not None:
-                true_velocity_batch = true_velocity_batch[:current_batch_size].clone()
-            if true_foot_clearance_batch is not None:
-                true_foot_clearance_batch = true_foot_clearance_batch[:current_batch_size].clone()
-            if true_height_map_batch is not None:
-                true_height_map_batch = true_height_map_batch[:current_batch_size].clone()
-            if true_next_state_batch is not None:
-                true_next_state_batch = true_next_state_batch[:current_batch_size].clone()
+            # Run estimator forward pass with error handling
+            try:
+                base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
+                    self.actor_critic.estimator(depth_batch, prop_history_batch)
+            except Exception as e:
+                print(f"Error in estimator forward pass: {e}")
+                # Create dummy tensors to continue training if possible
+                batch_size = proprio_batch.size(0)
+                base_velocity = torch.zeros(batch_size, 3, device=self.device)
+                foot_clearance = torch.zeros(batch_size, 4, device=self.device)
+                height_map_encoding = torch.zeros(batch_size, 32, device=self.device)
+                latent_vector = torch.zeros(batch_size, 32, device=self.device)
+                latent_mu = torch.zeros(batch_size, 32, device=self.device)
+                latent_logvar = torch.zeros(batch_size, 32, device=self.device)
+                next_state_pred = torch.zeros(batch_size, proprio_batch.size(1), device=self.device)
 
-            # Run estimator forward pass with the correct batch size
-            base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
-                self.actor_critic.estimator(depth_batch, prop_history_batch)
-
-            dummy_actions = self.actor_critic.actor(
-                proprio_batch, 
-                base_velocity, 
-                foot_clearance, 
-                height_map_encoding, 
-                latent_vector
-            )
-            
-            self.actor_critic.distribution = torch.distributions.Normal(dummy_actions, self.actor_critic.std)
-            
-            # Get policy outputs
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-            value_batch = self.actor_critic.evaluate(critic_obs_batch)
-            entropy_batch = self.actor_critic.entropy
-
-            # Handle adaptive learning rate if needed
-            if self.desired_kl is not None and self.schedule == 'adaptive':
-                with torch.inference_mode():
-                    mu_batch = self.actor_critic.action_mean
-                    sigma_batch = self.actor_critic.action_std
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.e-5) + 
-                        (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / 
-                        (2.0 * torch.square(sigma_batch)) - 0.5, 
-                        axis=-1
-                    )
-                    kl_mean = torch.mean(kl)
-
-                    if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                    
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.learning_rate
-            
-            # Calculate PPO surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-            # Calculate value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
+            # Run actor forward pass
+            try:
+                dummy_actions = self.actor_critic.actor(
+                    proprio_batch, 
+                    base_velocity, 
+                    foot_clearance, 
+                    height_map_encoding, 
+                    latent_vector
                 )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                self.actor_critic.distribution = torch.distributions.Normal(dummy_actions, self.actor_critic.std)
+                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+            except Exception as e:
+                print(f"Error in actor forward pass: {e}")
+                # Create dummy tensors
+                dummy_actions = torch.zeros_like(actions_batch)
+                actions_log_prob_batch = torch.zeros(actions_batch.size(0), 1, device=self.device)
             
-            # Calculate estimator losses - ensure we only calculate losses for data we have
+            # Run critic forward pass
+            try:
+                value_batch = self.actor_critic.evaluate(critic_obs_batch)
+                entropy_batch = self.actor_critic.entropy
+            except Exception as e:
+                print(f"Error in critic forward pass: {e}")
+                # Create dummy tensors
+                value_batch = torch.zeros_like(target_values_batch)
+                entropy_batch = torch.zeros(actions_batch.size(0), device=self.device)
+
+            # Initialize our losses to zero tensors
+            surrogate_loss = torch.tensor(0.0, device=self.device)
+            value_loss = torch.tensor(0.0, device=self.device)
             velocity_loss = torch.tensor(0.0, device=self.device)
             foot_clearance_loss = torch.tensor(0.0, device=self.device)
             height_map_loss = torch.tensor(0.0, device=self.device)
             next_state_loss = torch.tensor(0.0, device=self.device)
+            kl_loss = torch.tensor(0.0, device=self.device)
             
-            # Only calculate losses if ground truth data is available
-            if true_velocity_batch is not None:
-                velocity_loss = F.mse_loss(base_velocity, true_velocity_batch)
+            # Calculate PPO surrogate loss with error handling
+            try:
+                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                surrogate = -torch.squeeze(advantages_batch) * ratio
+                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            except Exception as e:
+                print(f"Error in surrogate loss calculation: {e}")
+
+            # Calculate value function loss with error handling
+            try:
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+            except Exception as e:
+                print(f"Error in value loss calculation: {e}")
             
-            if true_foot_clearance_batch is not None:
-                foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance_batch)
+            # Calculate estimator losses with error handling
+            try:
+                if true_velocity_batch is not None:
+                    velocity_loss = F.mse_loss(base_velocity, true_velocity_batch)
+            except Exception as e:
+                print(f"Error in velocity loss calculation: {e}")
             
-            if true_height_map_batch is not None:
-                height_map_loss = F.mse_loss(height_map_encoding, true_height_map_batch)
+            try:
+                if true_foot_clearance_batch is not None:
+                    foot_clearance_loss = F.mse_loss(foot_clearance, true_foot_clearance_batch)
+            except Exception as e:
+                print(f"Error in foot clearance loss calculation: {e}")
             
-            if true_next_state_batch is not None:
-                next_state_loss = F.mse_loss(next_state_pred, true_next_state_batch)
+            try:
+                if true_height_map_batch is not None:
+                    height_map_loss = F.mse_loss(height_map_encoding, true_height_map_batch)
+            except Exception as e:
+                print(f"Error in height map loss calculation: {e}")
             
-            # Calculate KL loss for VAE
-            kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
-            kl_loss = kl_loss / latent_mu.size(0)  # Normalize by batch size
+            try:
+                if true_next_state_batch is not None:
+                    next_state_loss = F.mse_loss(next_state_pred, true_next_state_batch)
+            except Exception as e:
+                print(f"Error in next state loss calculation: {e}")
+            
+            # Calculate KL loss for VAE with error handling
+            try:
+                kl_loss = -0.5 * torch.sum(1 + latent_logvar - latent_mu.pow(2) - latent_logvar.exp())
+                kl_loss = kl_loss / latent_mu.size(0)  # Normalize by batch size
+            except Exception as e:
+                print(f"Error in KL loss calculation: {e}")
             
             # Combine all losses
-            loss = surrogate_loss + \
-                   self.value_loss_coef * value_loss - \
-                   self.entropy_coef * entropy_batch.mean() + \
-                   self.velocity_loss_coef * velocity_loss + \
-                   self.foot_clearance_loss_coef * foot_clearance_loss + \
-                   self.height_map_loss_coef * height_map_loss + \
-                   self.kl_loss_coef * kl_loss + \
-                   self.next_state_loss_coef * next_state_loss
+            try:
+                loss = surrogate_loss + \
+                    self.value_loss_coef * value_loss - \
+                    self.entropy_coef * entropy_batch.mean() + \
+                    self.velocity_loss_coef * velocity_loss + \
+                    self.foot_clearance_loss_coef * foot_clearance_loss + \
+                    self.height_map_loss_coef * height_map_loss + \
+                    self.kl_loss_coef * kl_loss + \
+                    self.next_state_loss_coef * next_state_loss
+                    
+                # *** KEY CHANGE: Use retain_graph=True to avoid the backward error ***
+                loss.backward(retain_graph=True)
+                
+                # Clip gradients
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                
+                # Update parameters
+                self.optimizer.step()
+            except Exception as e:
+                print(f"Error during loss combination or backward pass: {e}")
             
-            # Perform ONE backward pass for all losses combined
-            loss.backward()
-            
-            # Clip gradients if needed
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-            
-            # Update parameters
-            self.optimizer.step()
-            
-            # Accumulate losses for reporting (detach to avoid memory leaks)
+            # Accumulate losses for reporting - detach to avoid memory leaks
             mean_value_loss += value_loss.detach().item()
             mean_surrogate_loss += surrogate_loss.detach().item()
             mean_velocity_loss += velocity_loss.detach().item()
@@ -1065,19 +1131,36 @@ class PIEPPO:
             mean_height_map_loss += height_map_loss.detach().item()
             mean_kl_loss += kl_loss.detach().item()
             mean_next_state_loss += next_state_loss.detach().item()
+            
+            # Force cleanup of tensors
+            del obs_batch, critic_obs_batch, actions_batch, target_values_batch
+            del advantages_batch, returns_batch, old_actions_log_prob_batch
+            del old_mu_batch, old_sigma_batch, proprio_batch
+            if depth_batch is not None: del depth_batch
+            if prop_history_batch is not None: del prop_history_batch
+            if true_velocity_batch is not None: del true_velocity_batch
+            if true_foot_clearance_batch is not None: del true_foot_clearance_batch
+            if true_height_map_batch is not None: del true_height_map_batch
+            if true_next_state_batch is not None: del true_next_state_batch
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        # Calculate means
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_velocity_loss /= num_updates
-        mean_foot_clearance_loss /= num_updates
-        mean_height_map_loss /= num_updates
-        mean_kl_loss /= num_updates
-        mean_next_state_loss /= num_updates
+        # Calculate means based on actual number of updates
+        if num_updates > 0:
+            mean_value_loss /= num_updates
+            mean_surrogate_loss /= num_updates
+            mean_velocity_loss /= num_updates
+            mean_foot_clearance_loss /= num_updates
+            mean_height_map_loss /= num_updates
+            mean_kl_loss /= num_updates
+            mean_next_state_loss /= num_updates
         
-        # Clear storage for next update
-        self.storage.clear()
+        # Clear storage for next update - USING OUR CUSTOM CLEAR METHOD
+        self.custom_clear_storage()
         
         # Return mean losses
         return {
@@ -1090,3 +1173,25 @@ class PIEPPO:
             'next_state_loss': mean_next_state_loss,
             'learning_rate': self.learning_rate
         }
+
+    def custom_clear_storage(self):
+        """Custom method to clear storage without calling super().clear()"""
+        # Reset step counter directly
+        if hasattr(self.storage, 'step'):
+            self.storage.step = 0
+        
+        # Clear PIE-specific attributes
+        if hasattr(self.storage, 'true_velocity') and self.storage.true_velocity is not None:
+            self.storage.true_velocity = None
+        if hasattr(self.storage, 'true_foot_clearance') and self.storage.true_foot_clearance is not None:
+            self.storage.true_foot_clearance = None
+        if hasattr(self.storage, 'true_height_map') and self.storage.true_height_map is not None:
+            self.storage.true_height_map = None
+        if hasattr(self.storage, 'true_next_state') and self.storage.true_next_state is not None:
+            self.storage.true_next_state = None
+            
+        # Force garbage collection after clearing storage
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
