@@ -82,8 +82,8 @@ class PIEEstimator(nn.Module):
         self.hidden_states = None
         
     def reset_hidden_states(self, batch_size, device):
-        self.hidden_states = torch.zeros(1, batch_size, 512, device=device)
-    
+        self.hidden_states = torch.zeros(1, batch_size, self.hidden_dim, device=device)
+
     def encode(self, depth_images, prop_history):
         if depth_images is None:
             batch_size = prop_history.shape[0]
@@ -100,9 +100,9 @@ class PIEEstimator(nn.Module):
         
         transformed_features = self.transformer_encoder(combined_features.unsqueeze(1))
         
-        if self.hidden_states is None:
-            self.reset_hidden_states(batch_size, depth_images.device)
-        
+        if self.hidden_states is None or self.hidden_states.size(1) != batch_size:
+            self.hidden_states = torch.zeros(1, batch_size, self.hidden_dim, device=depth_images.device)   
+
         gru_out, self.hidden_states = self.gru(transformed_features, self.hidden_states)
         
         return gru_out.squeeze(1)

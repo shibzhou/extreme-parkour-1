@@ -943,7 +943,19 @@ class PIEPPO:
             # Run estimator forward pass
             base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
                 self.actor_critic.estimator(depth_batch, prop_history_batch)
+
+            current_batch_size = actions_batch.size(0)
             
+            # Use a dummy forward pass to update the distribution
+            proprio_batch = obs_batch[:, :self.actor_critic.num_proprio]
+            dummy_actions = self.actor_critic.actor(
+                proprio_batch, 
+                base_velocity, 
+                foot_clearance, 
+                height_map_encoding, 
+                latent_vector
+            )
+
             # Get policy outputs
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1] if hid_states_batch is not None else None)
