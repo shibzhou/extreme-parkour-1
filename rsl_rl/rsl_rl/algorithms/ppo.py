@@ -922,32 +922,44 @@ class PIEPPO:
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
             old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
             
-            # Get PIE-specific data for this batch
-            # Note: For mini-batch training, we need to match the indices
-            batch_indices = None  # The current mini-batch indices
+            # IMPORTANT: Get only the data relevant to the current mini-batch
+            # Get current batch size
+            current_batch_size = obs_batch.size(0)
             
-            # If using mini-batches, extract the current indices
-            if hasattr(self.storage, 'current_indices') and self.storage.current_indices is not None:
-                batch_indices = self.storage.current_indices
+            # Extract proprioceptive part for the PIE estimator
+            proprio_batch = obs_batch[:, :self.actor_critic.num_proprio]
             
-            # Get batches with matching indices
-            depth_batch = self.storage.get_depth_images_batch(batch_indices)
-            prop_history_batch = self.storage.get_prop_history_batch(batch_indices)
+            # Get the depth and prop history for just this mini-batch
+            depth_batch = self.storage.get_depth_images_batch(None)
+            prop_history_batch = self.storage.get_prop_history_batch(None)
             
-            # Get ground truth values for estimator training (if available)
-            true_velocity_batch = self.storage.get_true_velocity_batch(batch_indices)
-            true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(batch_indices)
-            true_height_map_batch = self.storage.get_true_height_map_batch(batch_indices)
-            true_next_state_batch = self.storage.get_true_next_state_batch(batch_indices)
+            # Make sure we only use the amount of data matching the current mini-batch
+            depth_batch = depth_batch[:current_batch_size] if depth_batch is not None else None
+            prop_history_batch = prop_history_batch[:current_batch_size] if prop_history_batch is not None else None
             
-            # Run estimator forward pass
+            if depth_batch is not None:
+                depth_batch = depth_batch.clone()
+            if prop_history_batch is not None:
+                prop_history_batch = prop_history_batch.clone()
+            
+            true_velocity_batch = self.storage.get_true_velocity_batch(None)
+            true_foot_clearance_batch = self.storage.get_true_foot_clearance_batch(None)
+            true_height_map_batch = self.storage.get_true_height_map_batch(None)
+            true_next_state_batch = self.storage.get_true_next_state_batch(None)
+
+            if true_velocity_batch is not None:
+                true_velocity_batch = true_velocity_batch[:current_batch_size].clone()
+            if true_foot_clearance_batch is not None:
+                true_foot_clearance_batch = true_foot_clearance_batch[:current_batch_size].clone()
+            if true_height_map_batch is not None:
+                true_height_map_batch = true_height_map_batch[:current_batch_size].clone()
+            if true_next_state_batch is not None:
+                true_next_state_batch = true_next_state_batch[:current_batch_size].clone()
+
+            # Run estimator forward pass with the correct batch size
             base_velocity, foot_clearance, height_map_encoding, latent_vector, latent_mu, latent_logvar, next_state_pred = \
                 self.actor_critic.estimator(depth_batch, prop_history_batch)
 
-            current_batch_size = actions_batch.size(0)
-            
-            # Use a dummy forward pass to update the distribution
-            proprio_batch = obs_batch[:, :self.actor_critic.num_proprio]
             dummy_actions = self.actor_critic.actor(
                 proprio_batch, 
                 base_velocity, 
@@ -955,10 +967,12 @@ class PIEPPO:
                 height_map_encoding, 
                 latent_vector
             )
-
+            
+            self.actor_critic.distribution = torch.distributions.Normal(dummy_actions, self.actor_critic.std)
+            
             # Get policy outputs
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-            value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1] if hid_states_batch is not None else None)
+            value_batch = self.actor_critic.evaluate(critic_obs_batch)
             entropy_batch = self.actor_critic.entropy
 
             # Handle adaptive learning rate if needed
@@ -1034,20 +1048,23 @@ class PIEPPO:
                    self.kl_loss_coef * kl_loss + \
                    self.next_state_loss_coef * next_state_loss
             
-            # Optimize
-            self.optimizer.zero_grad()
+            # Perform ONE backward pass for all losses combined
             loss.backward()
+            
+            # Clip gradients if needed
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            
+            # Update parameters
             self.optimizer.step()
             
-            # Track losses
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_velocity_loss += velocity_loss.item()
-            mean_foot_clearance_loss += foot_clearance_loss.item()
-            mean_height_map_loss += height_map_loss.item()
-            mean_kl_loss += kl_loss.item()
-            mean_next_state_loss += next_state_loss.item()
+            # Accumulate losses for reporting (detach to avoid memory leaks)
+            mean_value_loss += value_loss.detach().item()
+            mean_surrogate_loss += surrogate_loss.detach().item()
+            mean_velocity_loss += velocity_loss.detach().item()
+            mean_foot_clearance_loss += foot_clearance_loss.detach().item()
+            mean_height_map_loss += height_map_loss.detach().item()
+            mean_kl_loss += kl_loss.detach().item()
+            mean_next_state_loss += next_state_loss.detach().item()
         
         # Calculate means
         num_updates = self.num_learning_epochs * self.num_mini_batches
